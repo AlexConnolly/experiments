@@ -18,9 +18,19 @@ interface Route {
   weight: number
   width: number
   bridge?: boolean
+  /** terrain height at each end — bridges interpolate between them */
+  h0?: number
+  h1?: number
 }
 
-function buildRoutes(roads: WorldData['roads']): Route[] {
+/** Ground height under a route position: bridges span, everything else drapes. */
+function routeGround(route: Route, s: number, x: number, z: number, terrain: Terrain): number {
+  if (route.bridge)
+    return (route.h0 ?? 0) + ((route.h1 ?? 0) - (route.h0 ?? 0)) * (s / route.length) + 2.8
+  return terrain.h(x, z)
+}
+
+function buildRoutes(roads: WorldData['roads'], terrain: Terrain): Route[] {
   const routes: Route[] = []
   for (const r of roads) {
     if (r.kind !== 'road' || r.width < 5) continue
@@ -39,6 +49,8 @@ function buildRoutes(roads: WorldData['roads']): Route[] {
         weight: length * Math.pow(r.width / 5.5, 2),
         width: r.width,
         bridge: r.bridge,
+        h0: terrain.h(r.path[0][0], r.path[0][1]),
+        h1: terrain.h(r.path[r.path.length - 1][0], r.path[r.path.length - 1][1]),
       })
   }
   return routes
@@ -98,7 +110,7 @@ export function Cars({
   const cabin = useRef<THREE.InstancedMesh>(null)
   const heads = useRef<THREE.InstancedMesh>(null)
   const tails = useRef<THREE.InstancedMesh>(null)
-  const routes = useMemo(() => buildRoutes(world.roads), [world])
+  const routes = useMemo(() => buildRoutes(world.roads, terrain), [world, terrain])
 
   const fleet = useMemo(() => {
     if (!routes.length)
@@ -158,8 +170,8 @@ export function Cars({
       // keep to the left lane, gives two-way traffic on shared roads
       const px = x - fz * 1.4
       const pz = z + fx * 1.4
-      // vehicles ride the terrain, plus a bridge's elevated deck
-      const lift = (route.bridge ? 2.8 : 0) + terrain.h(px, pz)
+      // vehicles ride the terrain, or a bridge's spanning deck
+      const lift = routeGround(route, s, px, pz, terrain)
       tmp.q.setFromAxisAngle(tmp.up, Math.atan2(fx, fz))
       tmp.p.set(px, (v.kind === 'bus' ? 1.6 : 0.95) + lift, pz)
       tmp.m.compose(tmp.p, tmp.q, tmp.s)
@@ -376,10 +388,12 @@ export function Pedestrians({
           weight: length,
           width: r.width,
           bridge: r.bridge,
+          h0: terrain.h(r.path[0][0], r.path[0][1]),
+          h1: terrain.h(r.path[r.path.length - 1][0], r.path[r.path.length - 1][1]),
         })
     }
     return out
-  }, [world])
+  }, [world, terrain])
 
   const walkers = useMemo(() => {
     if (!routes.length) return []
@@ -427,10 +441,7 @@ export function Pedestrians({
       const { x, z, dx, dz } = pointAt(route, s)
       tmp.p.set(
         x - dz * w.side,
-        0.95 +
-          terrain.h(x, z) +
-          (route.bridge ? 2.8 : 0) +
-          Math.abs(Math.sin(t * 4.5 + w.bob)) * 0.12,
+        0.95 + routeGround(route, s, x, z, terrain) + Math.abs(Math.sin(t * 4.5 + w.bob)) * 0.12,
         z + dx * w.side,
       )
       tmp.q.setFromAxisAngle(tmp.up, Math.atan2(dx * w.dir, dz * w.dir))
@@ -547,11 +558,13 @@ export function Trains({ world, terrain }: { world: WorldData; terrain: Terrain 
           weight: length,
           width: 4,
           bridge: r.bridge,
+          h0: terrain.h(r.path[0][0], r.path[0][1]),
+          h1: terrain.h(r.path[r.path.length - 1][0], r.path[r.path.length - 1][1]),
         })
     }
     // longest lines carry the trains
     return out.sort((a, b) => b.length - a.length).slice(0, 4)
-  }, [world])
+  }, [world, terrain])
 
   useFrame(({ clock }) => {
     if (!group.current) return
@@ -561,13 +574,12 @@ export function Trains({ world, terrain }: { world: WorldData; terrain: Terrain 
       const dir = ti % 2 === 0 ? 1 : -1
       const speed = 13 + rand(ti * 9.1) * 5
       const head = rand(ti * 3.7) * 600 + t * speed
-      const lift = route.bridge ? 2.8 : 0
       train.children.forEach((carriage, ci) => {
         let s = (head - ci * (CARRIAGE_LEN + CARRIAGE_GAP)) % route.length
         s = ((s % route.length) + route.length) % route.length
         if (dir < 0) s = route.length - s
         const { x, z, dx, dz } = pointAt(route, s)
-        carriage.position.set(x, terrain.h(x, z) + 2 + lift, z)
+        carriage.position.set(x, routeGround(route, s, x, z, terrain) + 2, z)
         carriage.rotation.y = Math.atan2(dx * dir, dz * dir)
       })
     })
@@ -714,7 +726,7 @@ export function Streetlamps({
   const spots = useMemo(() => {
     const out: { x: number; z: number }[] = []
     for (const r of world.roads) {
-      if (r.kind !== 'road' || r.width < 5) continue
+      if (r.kind !== 'road' || r.width < 5 || r.bridge) continue
       const cum = [0]
       for (let i = 1; i < r.path.length; i++) {
         const [ax, az] = r.path[i - 1]
