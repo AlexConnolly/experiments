@@ -1,0 +1,55 @@
+@import 'tailwindcss';
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  font-family:
+    ui-rounded,
+    'SF Pro Rounded',
+    'Segoe UI',
+    system-ui,
+    -apple-system,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+@keyframes mw-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.25);
+  }
+}
+
+@keyframes mw-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mw-rise {
+  animation: mw-rise 1.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.mw-breathe {
+  animation: mw-breathe 2.4s ease-in-out infinite;
+}
