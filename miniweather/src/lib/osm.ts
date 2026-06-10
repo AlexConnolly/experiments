@@ -44,6 +44,7 @@ function buildQuery(lat: number, lon: number): string {
   way["railway"](${bbox});
   way["aeroway"](${bbox});
   way["natural"="water"](${bbox});
+  way["natural"="coastline"](${bbox});
   way["waterway"](${bbox});
   relation["natural"="water"](${bbox});
   relation["waterway"="riverbank"](${bbox});
@@ -109,7 +110,7 @@ function roadInfo(
   }
 }
 
-const CACHE_PREFIX = 'mw-world-v10:'
+const CACHE_PREFIX = 'mw-world-v11:'
 
 function cacheKey(coords: Coords): string {
   return `${CACHE_PREFIX}${coords.lat.toFixed(3)},${coords.lon.toFixed(3)}`
@@ -202,6 +203,7 @@ function parse(elements: OsmElement[], origin: Coords): WorldData {
     trees: [],
   }
   const residential: [number, number][][] = []
+  const coastSegs: [number, number][][] = []
 
   for (const el of elements) {
     if (el.type === 'node' && el.tags?.['natural'] === 'tree' && el.lat && el.lon) {
@@ -278,6 +280,10 @@ function parse(elements: OsmElement[], origin: Coords): WorldData {
         })
       continue
     }
+    if (tags['natural'] === 'coastline') {
+      coastSegs.push(pts)
+      continue
+    }
     if (tags['natural'] === 'water' || tags['waterway'] === 'riverbank') {
       if (closed) world.water.push(pts.slice(0, -1))
       continue
@@ -297,6 +303,9 @@ function parse(elements: OsmElement[], origin: Coords): WorldData {
       world.green.push(pts.slice(0, -1))
     }
   }
+
+  // the open sea isn't a polygon in OSM — close coastlines against the bbox
+  buildSea(world, coastSegs)
 
   // villages often have estates mapped as landuse but no house footprints:
   // fill the gap with plausible houses along the roads
@@ -322,6 +331,120 @@ function pointInPoly(x: number, z: number, poly: [number, number][]): boolean {
       inside = !inside
   }
   return inside
+}
+
+/**
+ * OSM maps the coast as open `natural=coastline` ways (land left, water
+ * right) — the sea itself has no polygon. Stitch the segments, then close
+ * each long coastline against the bbox both ways and keep whichever side
+ * contains fewer buildings: that's the sea.
+ */
+function buildSea(world: WorldData, segs: [number, number][][]) {
+  if (!segs.length) return
+  const EPS = 1.5
+  const near = (a: [number, number], b: [number, number]) =>
+    Math.hypot(a[0] - b[0], a[1] - b[1]) < EPS
+  const pool = segs.filter((s) => s.length >= 2).map((s) => s.slice())
+  const lines: [number, number][][] = []
+  while (pool.length) {
+    const line = pool.pop()!
+    let extended = true
+    while (extended) {
+      extended = false
+      for (let i = 0; i < pool.length; i++) {
+        const seg = pool[i]
+        const head = line[0]
+        const tail = line[line.length - 1]
+        if (near(seg[0], tail)) line.push(...seg.slice(1))
+        else if (near(seg[seg.length - 1], tail)) line.push(...seg.slice(0, -1).reverse())
+        else if (near(seg[seg.length - 1], head)) line.unshift(...seg.slice(0, -1))
+        else if (near(seg[0], head)) line.unshift(...seg.slice(1).reverse())
+        else continue
+        pool.splice(i, 1)
+        extended = true
+        break
+      }
+    }
+    lines.push(line)
+  }
+
+  const L = 690
+  const P = 8 * L
+  const clampPt = ([x, z]: [number, number]): [number, number] => [
+    Math.max(-L, Math.min(L, x)),
+    Math.max(-L, Math.min(L, z)),
+  ]
+  const perim = ([x, z]: [number, number]): number => {
+    const dTop = Math.abs(z + L)
+    const dRight = Math.abs(x - L)
+    const dBottom = Math.abs(z - L)
+    const dLeft = Math.abs(x + L)
+    const m = Math.min(dTop, dRight, dBottom, dLeft)
+    if (m === dTop) return x + L
+    if (m === dRight) return 2 * L + (z + L)
+    if (m === dBottom) return 4 * L + (L - x)
+    return 6 * L + (L - z)
+  }
+  const pointAtPerim = (s: number): [number, number] => {
+    s = ((s % P) + P) % P
+    if (s < 2 * L) return [s - L, -L]
+    if (s < 4 * L) return [L, s - 3 * L]
+    if (s < 6 * L) return [5 * L - s, L]
+    return [-L, 7 * L - s]
+  }
+
+  const centroids: [number, number][] = world.buildings.slice(0, 600).map((b) => {
+    let x = 0
+    let z = 0
+    for (const p of b.footprint) {
+      x += p[0]
+      z += p[1]
+    }
+    return [x / b.footprint.length, z / b.footprint.length]
+  })
+
+  const candidates = lines
+    .filter((l) => {
+      if (l.length < 2 || near(l[0], l[l.length - 1])) return false
+      let len = 0
+      for (let i = 1; i < l.length; i++)
+        len += Math.hypot(l[i][0] - l[i - 1][0], l[i][1] - l[i - 1][1])
+      return len > 250
+    })
+    .slice(0, 2)
+
+  for (const line of candidates) {
+    const path = line.map(clampPt)
+    const sEntry = perim(path[0])
+    const sExit = perim(path[path.length - 1])
+    const close = (dir: 1 | -1): [number, number][] => {
+      const ring = path.slice()
+      let s = sExit
+      for (let guard = 0; guard < 5; guard++) {
+        const toTarget = (((dir === 1 ? sEntry - s : s - sEntry) % P) + P) % P
+        const nextCorner =
+          dir === 1
+            ? (Math.floor(s / (2 * L) + 1e-7) + 1) * 2 * L
+            : (Math.ceil(s / (2 * L) - 1e-7) - 1) * 2 * L
+        const toCorner = (((dir === 1 ? nextCorner - s : s - nextCorner) % P) + P) % P
+        if (toTarget <= toCorner || toTarget < 0.01) break
+        s = ((nextCorner % P) + P) % P
+        ring.push(pointAtPerim(s))
+      }
+      return ring
+    }
+    const ringA = close(1)
+    const ringB = close(-1)
+    const count = (ring: [number, number][]) => {
+      let c = 0
+      for (const [x, z] of centroids) if (pointInPoly(x, z, ring)) c++
+      return c
+    }
+    const a = count(ringA)
+    const b = count(ringB)
+    if (a === b) continue
+    world.water.push(a < b ? ringA : ringB)
+  }
 }
 
 /**

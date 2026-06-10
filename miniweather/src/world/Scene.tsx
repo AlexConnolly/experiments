@@ -3,6 +3,7 @@ import * as THREE from 'three'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Bloom, EffectComposer, TiltShift2 } from '@react-three/postprocessing'
 import type { Coords, Weather, WorldData } from '../lib/types'
+import type { Terrain } from '../lib/terrain'
 import { themeFor } from '../lib/theme'
 import { sunPosition } from '../lib/astro'
 import { Diorama } from './Diorama'
@@ -161,7 +162,8 @@ function SkyLight({ coords, weather }: { coords: Coords; weather: Weather }) {
       intensity={intensity}
       castShadow
       shadow-mapSize={[2048, 2048]}
-      shadow-bias={-0.0004}
+      shadow-bias={-0.0002}
+      shadow-normalBias={2.5}
     >
       <orthographicCamera attach="shadow-camera" args={[-760, 760, 760, -760, 10, 2000]} />
     </directionalLight>
@@ -172,17 +174,21 @@ function SceneContents({
   world,
   weather,
   coords,
+  terrain,
 }: {
   world: WorldData
   weather: Weather
   coords: Coords
+  terrain: Terrain
 }) {
   const theme = useMemo(
     () => themeFor(weather.condition, weather.isDay),
     [weather.condition, weather.isDay],
   )
   const landmarks = useMemo(() => placeLandmarks(coords), [coords])
-  const { scene } = useThree()
+  const { scene, size } = useThree()
+  // tilt-shift eases off on big screens; phones keep the strong miniature look
+  const blur = size.width < 700 ? 0.12 : size.width < 1100 ? 0.07 : 0.045
 
   useEffect(() => {
     // density compensated for the doubled camera distance; kept light so
@@ -227,19 +233,20 @@ function SceneContents({
         world={world}
         theme={theme}
         isDay={weather.isDay}
+        terrain={terrain}
         exclusions={landmarks}
       />
-      <Landmarks placed={landmarks} />
-      <Cars world={world} isDay={weather.isDay} />
-      <ParkedCars world={world} />
-      <Pedestrians world={world} isDay={weather.isDay} />
-      <Boats world={world} />
-      <Trains world={world} />
+      <Landmarks placed={landmarks} terrain={terrain} />
+      <Cars world={world} isDay={weather.isDay} terrain={terrain} />
+      <ParkedCars world={world} terrain={terrain} />
+      <Pedestrians world={world} isDay={weather.isDay} terrain={terrain} />
+      <Boats world={world} terrain={terrain} />
+      <Trains world={world} terrain={terrain} />
       <Balloon weather={weather} />
-      <Flights coords={coords} isDay={weather.isDay} />
+      <Flights coords={coords} isDay={weather.isDay} terrain={terrain} />
       <Birds weather={weather} />
-      <Streetlamps world={world} isDay={weather.isDay} />
-      <Smoke world={world} weather={weather} />
+      <Streetlamps world={world} isDay={weather.isDay} terrain={terrain} />
+      <Smoke world={world} weather={weather} terrain={terrain} />
 
       <Clouds theme={theme} />
       {raining && <Rain heavy={weather.condition !== 'drizzle'} />}
@@ -254,7 +261,7 @@ function SceneContents({
           mipmapBlur
           radius={0.7}
         />
-        <TiltShift2 blur={0.12} />
+        <TiltShift2 blur={blur} />
       </EffectComposer>
     </>
   )
@@ -264,10 +271,12 @@ export function Scene({
   world,
   weather,
   coords,
+  terrain,
 }: {
   world: WorldData
   weather: Weather
   coords: Coords
+  terrain: Terrain
 }) {
   return (
     <Canvas
@@ -283,7 +292,7 @@ export function Scene({
         ;(window as unknown as Record<string, unknown>).__mw = state
       }}
     >
-      <SceneContents world={world} weather={weather} coords={coords} />
+      <SceneContents world={world} weather={weather} coords={coords} terrain={terrain} />
     </Canvas>
   )
 }

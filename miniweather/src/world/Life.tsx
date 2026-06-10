@@ -2,6 +2,7 @@ import { useMemo, useRef } from 'react'
 import * as THREE from 'three'
 import { useFrame } from '@react-three/fiber'
 import type { Weather, WorldData } from '../lib/types'
+import type { Terrain } from '../lib/terrain'
 import { HALF, WORLD_HALF, clipPlanes } from './Diorama'
 
 function rand(seed: number): number {
@@ -80,7 +81,15 @@ interface Vehicle {
   halfLen: number
 }
 
-export function Cars({ world, isDay }: { world: WorldData; isDay: boolean }) {
+export function Cars({
+  world,
+  isDay,
+  terrain,
+}: {
+  world: WorldData
+  isDay: boolean
+  terrain: Terrain
+}) {
   const meshes = useRef<Record<VehicleKind, THREE.InstancedMesh | null>>({
     car: null,
     van: null,
@@ -149,10 +158,9 @@ export function Cars({ world, isDay }: { world: WorldData; isDay: boolean }) {
       // keep to the left lane, gives two-way traffic on shared roads
       const px = x - fz * 1.4
       const pz = z + fx * 1.4
-      // vehicles on a bridge way ride on its elevated deck
-      const lift = route.bridge ? 2.8 : 0
+      // vehicles ride the terrain, plus a bridge's elevated deck
+      const lift = (route.bridge ? 2.8 : 0) + terrain.h(px, pz)
       tmp.q.setFromAxisAngle(tmp.up, Math.atan2(fx, fz))
-
       tmp.p.set(px, (v.kind === 'bus' ? 1.6 : 0.95) + lift, pz)
       tmp.m.compose(tmp.p, tmp.q, tmp.s)
       meshes.current[v.kind]?.setMatrixAt(v.slot, tmp.m)
@@ -271,7 +279,7 @@ export function Cars({ world, isDay }: { world: WorldData; isDay: boolean }) {
 
 const PARKED_COLORS = ['#aeb4ba', '#8a9097', '#c2bcae', '#7e8a96', '#b0a8a0', '#5e6870', '#c9cdd2']
 
-export function ParkedCars({ world }: { world: WorldData }) {
+export function ParkedCars({ world, terrain }: { world: WorldData; terrain: Terrain }) {
   const { matrices, colors } = useMemo(() => {
     const matrices: THREE.Matrix4[] = []
     const colors: THREE.Color[] = []
@@ -301,7 +309,7 @@ export function ParkedCars({ world }: { world: WorldData }) {
         const pz = z + oz
         if (Math.abs(px) > WORLD_HALF - 2 || Math.abs(pz) > WORLD_HALF - 2) continue
         q.setFromAxisAngle(up, Math.atan2(dx, dz) + (rand(seed * 3.1) - 0.5) * 0.06)
-        p.set(px, 0.85, pz)
+        p.set(px, 0.85 + terrain.h(px, pz), pz)
         matrices.push(new THREE.Matrix4().compose(p, q, sc))
         colors.push(
           new THREE.Color(PARKED_COLORS[Math.floor(rand(seed * 7.9) * PARKED_COLORS.length)]),
@@ -311,7 +319,7 @@ export function ParkedCars({ world }: { world: WorldData }) {
       if (matrices.length >= 800) break
     }
     return { matrices, colors }
-  }, [world])
+  }, [world, terrain])
 
   if (!matrices.length) return null
   return (
@@ -339,7 +347,15 @@ export function ParkedCars({ world }: { world: WorldData }) {
 
 const CLOTHES = ['#d96459', '#5a87c5', '#e8b84f', '#6aa86a', '#b07ec9', '#e8e2d8', '#46555f', '#d98ca0']
 
-export function Pedestrians({ world, isDay }: { world: WorldData; isDay: boolean }) {
+export function Pedestrians({
+  world,
+  isDay,
+  terrain,
+}: {
+  world: WorldData
+  isDay: boolean
+  terrain: Terrain
+}) {
   const mesh = useRef<THREE.InstancedMesh>(null)
   const routes = useMemo(() => {
     const out: Route[] = []
@@ -411,7 +427,10 @@ export function Pedestrians({ world, isDay }: { world: WorldData; isDay: boolean
       const { x, z, dx, dz } = pointAt(route, s)
       tmp.p.set(
         x - dz * w.side,
-        0.95 + (route.bridge ? 2.8 : 0) + Math.abs(Math.sin(t * 4.5 + w.bob)) * 0.12,
+        0.95 +
+          terrain.h(x, z) +
+          (route.bridge ? 2.8 : 0) +
+          Math.abs(Math.sin(t * 4.5 + w.bob)) * 0.12,
         z + dx * w.side,
       )
       tmp.q.setFromAxisAngle(tmp.up, Math.atan2(dx * w.dir, dz * w.dir))
@@ -445,7 +464,7 @@ export function Pedestrians({ world, isDay }: { world: WorldData; isDay: boolean
 
 const BOAT_COLORS = ['#3f6f4f', '#7c4a3d', '#3d5a7c', '#8a3f4d']
 
-export function Boats({ world }: { world: WorldData }) {
+export function Boats({ world, terrain }: { world: WorldData; terrain: Terrain }) {
   const group = useRef<THREE.Group>(null)
   const routes = useMemo(() => {
     const out: Route[] = []
@@ -473,7 +492,7 @@ export function Boats({ world }: { world: WorldData }) {
       if (i % 2 === 1) s = route.length - s
       const { x, z, dx, dz } = pointAt(route, s)
       const dir = i % 2 === 1 ? -1 : 1
-      boat.position.set(x, 0.3 + Math.sin(t * 1.3 + i) * 0.06, z)
+      boat.position.set(x, terrain.h(x, z) + 0.3 + Math.sin(t * 1.3 + i) * 0.06, z)
       boat.rotation.y = Math.atan2(dx * dir, dz * dir)
       boat.rotation.z = Math.sin(t * 1.1 + i * 2) * 0.02
     })
@@ -508,7 +527,7 @@ const LIVERIES = ['#c8302a', '#2f5d9e', '#3f7a4a', '#d6762f']
 const CARRIAGE_LEN = 15
 const CARRIAGE_GAP = 1.5
 
-export function Trains({ world }: { world: WorldData }) {
+export function Trains({ world, terrain }: { world: WorldData; terrain: Terrain }) {
   const group = useRef<THREE.Group>(null)
   const routes = useMemo(() => {
     const out: Route[] = []
@@ -548,7 +567,7 @@ export function Trains({ world }: { world: WorldData }) {
         s = ((s % route.length) + route.length) % route.length
         if (dir < 0) s = route.length - s
         const { x, z, dx, dz } = pointAt(route, s)
-        carriage.position.set(x, 2 + lift, z)
+        carriage.position.set(x, terrain.h(x, z) + 2 + lift, z)
         carriage.rotation.y = Math.atan2(dx * dir, dz * dir)
       })
     })
@@ -683,7 +702,15 @@ export function Birds({ weather }: { weather: Weather }) {
 
 /* -------------------------------- streetlamps ------------------------------- */
 
-export function Streetlamps({ world, isDay }: { world: WorldData; isDay: boolean }) {
+export function Streetlamps({
+  world,
+  isDay,
+  terrain,
+}: {
+  world: WorldData
+  isDay: boolean
+  terrain: Terrain
+}) {
   const spots = useMemo(() => {
     const out: { x: number; z: number }[] = []
     for (const r of world.roads) {
@@ -720,13 +747,13 @@ export function Streetlamps({ world, isDay }: { world: WorldData; isDay: boolean
     const s = new THREE.Vector3(1, 1, 1)
     return {
       poles: spots.map(({ x, z }) =>
-        new THREE.Matrix4().compose(new THREE.Vector3(x, 2.6, z), q, s),
+        new THREE.Matrix4().compose(new THREE.Vector3(x, terrain.h(x, z) + 2.6, z), q, s),
       ),
       bulbs: spots.map(({ x, z }) =>
-        new THREE.Matrix4().compose(new THREE.Vector3(x, 5.4, z), q, s),
+        new THREE.Matrix4().compose(new THREE.Vector3(x, terrain.h(x, z) + 5.4, z), q, s),
       ),
     }
-  }, [spots])
+  }, [spots, terrain])
 
   if (isDay || !spots.length) return null
   return (
@@ -762,6 +789,7 @@ export function Streetlamps({ world, isDay }: { world: WorldData; isDay: boolean
 /* ---------------------------------- smoke ----------------------------------- */
 
 function Chimney({ x, z, top, seed }: { x: number; z: number; top: number; seed: number }) {
+  // top already includes terrain height
   const group = useRef<THREE.Group>(null)
   useFrame(({ clock }) => {
     if (!group.current) return
@@ -794,7 +822,15 @@ function Chimney({ x, z, top, seed }: { x: number; z: number; top: number; seed:
   )
 }
 
-export function Smoke({ world, weather }: { world: WorldData; weather: Weather }) {
+export function Smoke({
+  world,
+  weather,
+  terrain,
+}: {
+  world: WorldData
+  weather: Weather
+  terrain: Terrain
+}) {
   const chimneys = useMemo(() => {
     const candidates = world.buildings
       .map((b) => {
@@ -806,12 +842,12 @@ export function Smoke({ world, weather }: { world: WorldData; weather: Weather }
         }
         x /= b.footprint.length
         z /= b.footprint.length
-        return { x, z, top: b.height }
+        return { x, z, top: b.height + terrain.h(x, z) }
       })
       .filter((c) => Math.abs(c.x) < HALF - 20 && Math.abs(c.z) < HALF - 20)
       .sort((a, b) => b.top - a.top)
     return candidates.slice(0, 3)
-  }, [world])
+  }, [world, terrain])
 
   const cold = weather.temperature < 10
   const raining =

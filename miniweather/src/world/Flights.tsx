@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { useFrame } from '@react-three/fiber'
 import type { Coords } from '../lib/types'
+import type { Terrain } from '../lib/terrain'
 
 /**
  * Real aircraft currently overhead, via the free keyless adsb.lol API
@@ -19,7 +20,8 @@ const MAX_PLANES = 7
  * approach/landing traffic visibly descends toward the rooftops.
  */
 function skyHeight(altM: number): number {
-  return Math.min(16 + Math.sqrt(Math.max(altM, 0)) * 2.3, 290)
+  // base 6 ≈ wheel height of the toy-scaled model, so grounded planes sit down
+  return Math.min(6 + Math.sqrt(Math.max(altM, 0)) * 2.3, 290)
 }
 
 interface Plane {
@@ -127,9 +129,18 @@ function PlaneModel({ tail, night }: { tail: string; night: boolean }) {
   )
 }
 
-export function Flights({ coords, isDay }: { coords: Coords; isDay: boolean }) {
+export function Flights({
+  coords,
+  isDay,
+  terrain,
+}: {
+  coords: Coords
+  isDay: boolean
+  terrain: Terrain
+}) {
   const [planes, setPlanes] = useState<Plane[]>([])
   const refs = useRef<Map<string, THREE.Group>>(new Map())
+  const lastAlt = useRef<Map<string, { alt: number; t: number }>>(new Map())
 
   useEffect(() => {
     let alive = true
@@ -150,6 +161,21 @@ export function Flights({ coords, isDay }: { coords: Coords; isDay: boolean }) {
       for (const source of sources) {
         try {
           const p = await source()
+          // glide-slope fallback: if the feed omits a climb rate, derive it
+          // from the altitude change since the previous poll
+          const now = Date.now()
+          for (const plane of p) {
+            const prev = lastAlt.current.get(plane.id)
+            if (
+              plane.vRate === 0 &&
+              prev &&
+              now - prev.t > 5_000 &&
+              now - prev.t < 90_000
+            ) {
+              plane.vRate = (plane.altM - prev.alt) / ((now - prev.t) / 1000)
+            }
+            lastAlt.current.set(plane.id, { alt: plane.altM, t: now })
+          }
           if (alive) setPlanes(p)
           return
         } catch {
@@ -178,7 +204,10 @@ export function Flights({ coords, isDay }: { coords: Coords; isDay: boolean }) {
       }
       const g = refs.current.get(p.id)
       if (g) {
-        g.position.set(p.x, skyHeight(p.altM), p.z)
+        // never sink below the local ground, even over hills
+        const floor =
+          Math.abs(p.x) < 690 && Math.abs(p.z) < 690 ? terrain.h(p.x, p.z) + 6 : 6
+        g.position.set(p.x, Math.max(skyHeight(p.altM), floor), p.z)
         // model nose points +z; travel dir is (sin h, -cos h)
         g.rotation.y = Math.atan2(Math.sin(p.heading), -Math.cos(p.heading))
         // visible pitch when climbing or descending

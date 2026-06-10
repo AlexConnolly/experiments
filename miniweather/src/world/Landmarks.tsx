@@ -2,6 +2,7 @@ import { useRef } from 'react'
 import * as THREE from 'three'
 import { useFrame } from '@react-three/fiber'
 import type { Coords } from '../lib/types'
+import type { Terrain } from '../lib/terrain'
 import { LANDMARKS, type LandmarkKind } from '../lib/cities'
 import { WORLD_HALF, clipPlanes } from './Diorama'
 import { buildUniform, easeOutBack } from './buildAnim'
@@ -186,12 +187,18 @@ export function placeLandmarks(coords: Coords): PlacedLandmark[] {
   })).filter((p) => Math.abs(p.x) < WORLD_HALF - 15 && Math.abs(p.z) < WORLD_HALF - 15)
 }
 
-export function Landmarks({ placed }: { placed: PlacedLandmark[] }) {
+export function Landmarks({
+  placed,
+  terrain,
+}: {
+  placed: PlacedLandmark[]
+  terrain: Terrain
+}) {
   return (
     <>
       {placed.map((p, i) => (
-        <group key={`${p.kind}${i}`} position={[p.x, 0, p.z]}>
-          <Rise delay={1.6 + i * 0.5}>{MODELS[p.kind]()}</Rise>
+        <group key={`${p.kind}${i}`} position={[p.x, terrain.h(p.x, p.z), p.z]}>
+          <Rise delay={0.5 + i * 0.25}>{MODELS[p.kind]()}</Rise>
         </group>
       ))}
     </>

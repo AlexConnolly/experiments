@@ -16,7 +16,7 @@ import {
   windowDayTexture,
   windowNightTexture,
 } from '../lib/textures'
-import { buildCacheKey, buildUniform, easeOutBack, patchBuildMaterial, setColor, setDelay, setGround } from './buildAnim'
+import { buildCacheKey, buildUniform, easeOutBack, patchBuildMaterial, setColor, setDelay, setGround, setRate } from './buildAnim'
 import type { Terrain } from '../lib/terrain'
 
 /** One tile is HALF metres from centre to edge; the world is a 3x3 grid of tiles. */
@@ -84,14 +84,39 @@ function flatPolygons(
   return merged
 }
 
-/** Terrain-draped ribbon along a polyline, with u = metres/8 along its length. */
+/** Insert points so no segment is longer than maxLen — lets ribbons follow terrain. */
+function resample(path: [number, number][], maxLen = 18): [number, number][] {
+  const out: [number, number][] = [path[0]]
+  for (let i = 1; i < path.length; i++) {
+    const [ax, az] = path[i - 1]
+    const [bx, bz] = path[i]
+    const len = Math.hypot(bx - ax, bz - az)
+    const n = Math.max(1, Math.ceil(len / maxLen))
+    for (let k = 1; k <= n; k++)
+      out.push([ax + ((bx - ax) * k) / n, az + ((bz - az) * k) / n])
+  }
+  return out
+}
+
+/**
+ * Ribbon along a polyline, u = metres/8 along its length.
+ * 'drape' follows the terrain underneath; 'span' (bridges) runs straight
+ * from the height of one end to the other.
+ */
 function ribbon(
-  path: [number, number][],
+  rawPath: [number, number][],
   width: number,
   y: number,
   terrain: Terrain,
+  mode: 'drape' | 'span' = 'drape',
 ): THREE.BufferGeometry | null {
-  if (path.length < 2) return null
+  if (rawPath.length < 2) return null
+  const path = resample(rawPath)
+  let total = 0
+  for (let i = 1; i < path.length; i++)
+    total += Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1])
+  const h0 = terrain.h(path[0][0], path[0][1])
+  const h1 = terrain.h(path[path.length - 1][0], path[path.length - 1][1])
   const half = width / 2
   const positions: number[] = []
   const uvs: number[] = []
@@ -110,8 +135,9 @@ function ribbon(
     const lz = path[i][1] + dx * half
     const rx = path[i][0] + dz * half
     const rz = path[i][1] - dx * half
-    positions.push(lx, terrain.h(lx, lz) + y, lz)
-    positions.push(rx, terrain.h(rx, rz) + y, rz)
+    const spanH = h0 + (h1 - h0) * (total > 0 ? dist / total : 0)
+    positions.push(lx, (mode === 'span' ? spanH : terrain.h(lx, lz)) + y, lz)
+    positions.push(rx, (mode === 'span' ? spanH : terrain.h(rx, rz)) + y, rz)
     uvs.push(dist / 8, 0, dist / 8, 1)
     if (i > 0) {
       const a = (i - 1) * 2
@@ -133,11 +159,14 @@ function mergedRibbons(
   terrain: Terrain,
   filter: (r: WorldData['roads'][number]) => boolean,
   widen = 0,
+  mode: 'drape' | 'span' = 'drape',
 ): THREE.BufferGeometry | null {
   const parts: THREE.BufferGeometry[] = []
+  let idx = 0
   for (const r of roads) {
     if (!filter(r)) continue
-    const g = ribbon(r.path, r.width + widen, y, terrain)
+    // tiny per-way height jitter so overlapping ribbons never z-fight
+    const g = ribbon(r.path, r.width + widen, y + (idx++ % 5) * 0.02, terrain, mode)
     if (g) parts.push(g)
   }
   if (!parts.length) return null
@@ -227,13 +256,16 @@ function buildCity(
       g.translate(0, gH - 3, 0)
       const { roof, wall } = splitRoofWalls(g.toNonIndexed())
       g.dispose()
-      const delay = (Math.hypot(ecx, ecz) / WORLD_HALF) * 1.5 + hash(i * 3 + 1) * 1.1
+      // everything releases together; each building falls at its own pace
+      const delay = hash(i * 3 + 1) * 0.35
+      const rate = 0.7 + hash(i * 9 + 4) * 0.7
       const jitter = 0.9 + hash(i * 5 + 2) * 0.18
 
       color.set(WALL_PALETTE[Math.floor(hash(i * 7 + 13) * WALL_PALETTE.length)])
       color.multiplyScalar(jitter)
       setColor(wall, color)
       setDelay(wall, delay)
+      setRate(wall, rate)
       setGround(wall, gH)
       walls.push(wall)
 
@@ -241,6 +273,7 @@ function buildCity(
       color.multiplyScalar(0.9 + hash(i * 13 + 7) * 0.2)
       setColor(roof, color)
       setDelay(roof, delay)
+      setRate(roof, rate)
       setGround(roof, gH)
       roofs.push(roof)
     } catch {
@@ -332,7 +365,7 @@ function Trees({
           stretch: 0.85 + hash(i * 3) * 0.55,
           pine: hash(i * 41) < 0.28,
           color: base,
-          delay: (Math.hypot(x, z) / WORLD_HALF) * 1.5 + hash(i * 43) * 1.3,
+          delay: hash(i * 43) * 0.6,
         }
       })
   }, [spots, theme.snowGround, terrain])
@@ -457,21 +490,32 @@ function RailCatenary({ world, terrain }: { world: WorldData; terrain: Terrain }
     const sc = new THREE.Vector3(1, 1, 1)
     let side = 1
     for (const rail of world.rails) {
-      const lift = rail.bridge ? 2.8 : 0
+      const path = resample(rail.path, 24)
+      const cums = [0]
+      for (let i = 1; i < path.length; i++)
+        cums.push(
+          cums[i - 1] + Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]),
+        )
+      const total = cums[cums.length - 1] || 1
+      const h0 = terrain.h(path[0][0], path[0][1])
+      const h1 = terrain.h(path[path.length - 1][0], path[path.length - 1][1])
+      // bridges span; plain track drapes — same rule as the ribbons
+      const groundAt = (i: number) =>
+        rail.bridge
+          ? h0 + (h1 - h0) * (cums[i] / total) + 3.05
+          : terrain.h(path[i][0], path[i][1])
       // contact wire follows the track at mast height
-      for (let i = 1; i < rail.path.length; i++) {
-        const [ax, az] = rail.path[i - 1]
-        const [bx, bz] = rail.path[i]
+      for (let i = 1; i < path.length; i++) {
         wire.push(
-          ax, terrain.h(ax, az) + 5.6 + lift, az,
-          bx, terrain.h(bx, bz) + 5.6 + lift, bz,
+          path[i - 1][0], groundAt(i - 1) + 5.6, path[i - 1][1],
+          path[i][0], groundAt(i) + 5.6, path[i][1],
         )
       }
       // masts every ~45 m, alternating sides
       let carry = 18
-      for (let i = 1; i < rail.path.length && masts.length < 260; i++) {
-        const [ax, az] = rail.path[i - 1]
-        const [bx, bz] = rail.path[i]
+      for (let i = 1; i < path.length && masts.length < 260; i++) {
+        const [ax, az] = path[i - 1]
+        const [bx, bz] = path[i]
         const segLen = Math.hypot(bx - ax, bz - az)
         if (segLen < 0.5) continue
         const dx = (bx - ax) / segLen
@@ -484,7 +528,7 @@ function RailCatenary({ world, terrain }: { world: WorldData; terrain: Terrain }
           q.setFromAxisAngle(up, Math.atan2(dx, dz))
           masts.push(
             new THREE.Matrix4().compose(
-              new THREE.Vector3(mx, terrain.h(mx, mz) + 3 + lift, mz),
+              new THREE.Vector3(mx, groundAt(i - 1) + 3, mz),
               q,
               sc,
             ),
@@ -562,7 +606,7 @@ export function Diorama({
     [railRoads, terrain],
   )
   const railBridgeGeo = useMemo(
-    () => mergedRibbons(railRoads, 3.05, terrain, (r) => !!r.bridge),
+    () => mergedRibbons(railRoads, 3.05, terrain, (r) => !!r.bridge, 0, 'span'),
     [railRoads, terrain],
   )
   // airport surfaces
@@ -587,9 +631,9 @@ export function Diorama({
     [world, terrain],
   )
   const apronGeo = useMemo(() => flatPolygons(world.aprons, 0.1, terrain), [world, terrain])
-  // bridges fly above the water on a chunky stone deck
+  // bridges span bank to bank on a chunky stone deck — never draped into the dip
   const bridgeGeo = useMemo(
-    () => mergedRibbons(world.roads, 3.0, terrain, (r) => !!r.bridge),
+    () => mergedRibbons(world.roads, 3.0, terrain, (r) => !!r.bridge, 0, 'span'),
     [world, terrain],
   )
   const bridgeDeckGeo = useMemo(
@@ -600,6 +644,7 @@ export function Diorama({
         terrain,
         (r) => !!r.bridge,
         2.4,
+        'span',
       ),
     [world, railRoads, terrain],
   )
@@ -719,27 +764,12 @@ export function Diorama({
 
   return (
     <group>
-      {/* base slab — the diorama plinth, spanning the whole 3x3 grid */}
-      <mesh position={[0, -11, 0]} receiveShadow>
-        <boxGeometry args={[TILE * 3, 22, TILE * 3]} />
-        {['#7a6450', '#7a6450', '', '#54453a', '#8a7158', '#6d5946'].map((c, i) =>
-          i === 2 ? (
-            <meshStandardMaterial
-              key={i}
-              attach={`material-${i}`}
-              color={groundTop}
-              map={tx.paving}
-              roughness={0.95}
-            />
-          ) : (
-            <meshStandardMaterial
-              key={i}
-              attach={`material-${i}`}
-              color={c}
-              roughness={0.95}
-            />
-          ),
-        )}
+      {/* the ground: real terrain heightfield on an earthen plinth */}
+      <mesh geometry={groundGeo} receiveShadow>
+        <meshStandardMaterial color={groundTop} map={tx.paving} roughness={0.95} />
+      </mesh>
+      <mesh geometry={skirtGeo}>
+        <meshStandardMaterial color="#7a6450" roughness={0.95} side={THREE.DoubleSide} />
       </mesh>
 
       {greenGeo && (
@@ -802,7 +832,7 @@ export function Diorama({
           />
         </mesh>
       )}
-      <RailCatenary world={world} />
+      <RailCatenary world={world} terrain={terrain} />
       {apronGeo && (
         <mesh geometry={apronGeo} receiveShadow>
           <meshStandardMaterial color="#a7adb4" roughness={0.9} clippingPlanes={clipPlanes} />
@@ -866,7 +896,7 @@ export function Diorama({
         </mesh>
       )}
 
-      <Trees spots={treeSpots} theme={theme} />
+      <Trees spots={treeSpots} theme={theme} terrain={terrain} />
     </group>
   )
 }

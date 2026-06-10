@@ -6,7 +6,18 @@ import { fetchWorld } from './lib/osm'
 import { themeFor } from './lib/theme'
 import { ambience } from './lib/ambience'
 import { CITIES, type City } from './lib/cities'
+import { fetchTerrain, type Terrain } from './lib/terrain'
 import { Scene } from './world/Scene'
+
+/** Initial place from a shared ?at=lat,lon URL. */
+function cityFromUrl(): City | null {
+  const p = new URLSearchParams(window.location.search)
+  const at = p.get('at')
+  if (!at) return null
+  const [lat, lon] = at.split(',').map(Number)
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null
+  return { name: p.get('name') ?? 'shared place', lat, lon }
+}
 
 /** `?force=rain-day`, `?force=snow`, `?force=thunder-night`… for previewing moods. */
 function applyForcedWeather(w: Weather): Weather {
@@ -197,7 +208,8 @@ function CityBar({
 
 export default function App() {
   const [userCoords, setUserCoords] = useState<Coords | null>(null)
-  const [city, setCity] = useState<City | null>(null)
+  const [city, setCity] = useState<City | null>(cityFromUrl)
+  const [terrain, setTerrain] = useState<Terrain | null>(null)
   const [place, setPlace] = useState<string>('')
   const [weather, setWeather] = useState<Weather | null>(null)
   const [world, setWorld] = useState<WorldData | null>(null)
@@ -220,13 +232,30 @@ export default function App() {
     return userCoords
   }, [city, userCoords])
 
+  // keep the URL shareable: ?at=lat,lon&name=…
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search)
+    if (city) {
+      p.set('at', `${city.lat.toFixed(4)},${city.lon.toFixed(4)}`)
+      p.set('name', city.name)
+    } else {
+      p.delete('at')
+      p.delete('name')
+    }
+    const qs = p.toString()
+    window.history.replaceState(null, '', qs ? `?${qs}` : window.location.pathname)
+  }, [city])
+
   useEffect(() => {
     if (!coords) return
     let cancelled = false
     setWorld(null)
     setWorldError(false)
     setWeather(null)
+    setTerrain(null)
     setPlace(city ? city.name : '')
+
+    fetchTerrain(coords).then((t) => !cancelled && setTerrain(t))
 
     placeName(coords).then((n) => !cancelled && setPlace(n))
     fetchWorld(coords)
@@ -251,19 +280,20 @@ export default function App() {
     ? `linear-gradient(to bottom, ${theme.bg[0]}, ${theme.bg[1]})`
     : 'linear-gradient(to bottom, #232c47, #3b4a73)'
 
-  const ready = weather && (world || worldError)
+  const ready = weather && terrain && (world || worldError)
 
   return (
     <div
       className="relative h-full w-full overflow-hidden transition-[background] duration-[2500ms]"
       style={{ background: bg }}
     >
-      {ready && world && coords && (
+      {ready && world && coords && terrain && (
         <Scene
           key={`${coords.lat.toFixed(4)},${coords.lon.toFixed(4)}`}
           world={world}
           weather={weather}
           coords={coords}
+          terrain={terrain}
         />
       )}
 

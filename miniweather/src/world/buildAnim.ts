@@ -19,14 +19,15 @@ export function easeOutBack(t: number): number {
 
 export function patchBuildMaterial(shader: { uniforms: Record<string, unknown>; vertexShader: string }) {
   shader.uniforms.uBuild = buildUniform
+  // buildings drop into place from above (parked far overhead until their turn)
   shader.vertexShader =
-    'attribute float aDelay;\nattribute float aGround;\nuniform float uBuild;\n' +
+    'attribute float aDelay;\nattribute float aRate;\nuniform float uBuild;\n' +
     shader.vertexShader.replace(
       '#include <begin_vertex>',
       `#include <begin_vertex>
-      float bT = clamp((uBuild - aDelay) / 0.9, 0.0, 1.0);
-      float bS = 1.0 + 2.70158 * pow(bT - 1.0, 3.0) + 1.70158 * pow(bT - 1.0, 2.0);
-      transformed.y = aGround + (transformed.y - aGround) * bS;`,
+      float bT = clamp((uBuild - aDelay) / max(aRate, 0.2), 0.0, 1.0);
+      float eD = 1.0 - pow(1.0 - bT, 3.0);
+      transformed.y += (bT <= 0.0) ? 900.0 : (1.0 - eD) * 70.0;`,
     )
 }
 
@@ -38,6 +39,14 @@ export function setDelay(geo: THREE.BufferGeometry, delay: number) {
   const arr = new Float32Array(count)
   arr.fill(delay)
   geo.setAttribute('aDelay', new THREE.Float32BufferAttribute(arr, 1))
+}
+
+/** Add a per-vertex fall-duration attribute (seconds to settle). */
+export function setRate(geo: THREE.BufferGeometry, rate: number) {
+  const count = geo.attributes.position.count
+  const arr = new Float32Array(count)
+  arr.fill(rate)
+  geo.setAttribute('aRate', new THREE.Float32BufferAttribute(arr, 1))
 }
 
 /** Add a constant per-vertex ground-height attribute (build-anim pivot). */
