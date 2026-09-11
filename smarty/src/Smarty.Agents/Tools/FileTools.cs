@@ -1,0 +1,549 @@
+using System.Text;
+using System.Threading;
+
+namespace Smarty.Agents;
+
+/// <summary>
+/// Two file tools for a worker, mirroring <see cref="WebResearch"/>'s shape but pointed at the local disk:
+///
+/// 1. <c>read_file(path, offset, limit)</c> — extracts a file's text (via <see cref="FileText"/>) and returns
+///    a BOUNDED window of it, so a big document is read in sensible pages rather than dumped whole.
+/// 2. <c>file_summary(path, question)</c> — the file analogue of get_page_answer: extract the text, chunk it
+///    with overlap, rank the chunks against the question (BM25), and have the model write a short grounded
+///    answer from the best excerpts. Returns the ANSWER, already distilled — ideal for "tldr this".
+///
+/// Both reuse <see cref="WebResearch"/>'s chunking/ranking internals, so the two surfaces stay consistent.
+/// </summary>
+public static class FileTools
+{
+    private const int DefaultWindow = 4000; // chars returned by one read_file call when no limit is given
+
+    /// <summary>The most one call may return, however large a limit is asked for.</summary>
+    private const int MaxWindow = 6000;
+    private const int SummaryBudgetChars = 24000; // text fed to a single summary call (~6k tokens, fits num_ctx)
+
+    // ---- read_file ----------------------------------------------------------------------------
+
+    /// <param name="rootDir">Where a bare file name is looked for, as file_summary does. Without it only absolute
+    /// paths resolve, which is no use for a file the job was handed by name — which is how every file here is
+    /// referred to.</param>
+    public static AgentTool ReadFileTool(string name = "read_file", string? rootDir = null)
+    {
+        return new AgentTool(
+            name,
+            "Reads the text of a local file (text-based formats and PDFs) and returns a portion of it. Use " +
+            "offset/limit to page through a large file rather than reading it all at once.",
+            new[]
+            {
+                ToolParameter.String("path", "The path of the file to read.", required: true),
+                ToolParameter.Integer("offset", "Character offset to start reading from. Defaults to 0.", required: false),
+                ToolParameter.Integer("limit", $"How many characters to return. Defaults to {DefaultWindow}.", required: false),
+            },
+            (args, _) => Task.FromResult(ReadFile(args, rootDir)));
+    }
+
+    /// <summary>Newlines in a stretch of text — for reporting a window's position in lines rather than bytes.</summary>
+    private static int CountLines(string text, int from, int to)
+    {
+        int count = 0;
+        for (int i = from; i < to && i < text.Length; i++)
+            if (text[i] == '\n') count++;
+        return count;
+    }
+
+    private static ToolOutput ReadFile(ToolCallArguments args, string? rootDir = null)
+    {
+        string path = ResolvePath(args.GetString("path").Trim(), rootDir);
+        var extracted = FileText.Extract(path);
+        if (!extracted.Ok)
+            // A wrong format / scanned PDF won't read on a retry — route the model elsewhere rather than loop.
+            return ToolOutput.DeadEnd(extracted.Reason ?? "Couldn't read that file.");
+
+        string text = extracted.Text;
+        if (text.Length == 0)
+            return ToolOutput.Ok($"'{Path.GetFileName(path)}' is empty.");
+
+        int offset = Math.Clamp(args.GetInt("offset", 0), 0, text.Length);
+        // Ceiling, not just a default. A limit the caller can raise to fifty thousand is not a limit — that is
+        // twelve thousand tokens from one call, and the whole point of a window is that the window is small.
+        int limit = Math.Clamp(args.GetInt("limit", DefaultWindow), 1, MaxWindow);
+        int take = Math.Min(limit, text.Length - offset);
+        string window = text.Substring(offset, take);
+        int end = offset + take;
+
+        // Say what it IS, not just how many characters came back. "week_of_dinners.pdf (PDF)" tells the model it
+        // is reading extracted prose; a .cs with no label reads like the file itself. And for anything text-like —
+        // which is to say code and config — report LINES, because that is the unit someone navigates source in
+        // and the unit find_in_file answers with.
+        var lines = extracted.Kind == "text"
+            ? $", lines {CountLines(text, 0, offset) + 1}–{CountLines(text, 0, end)}"
+            : "";
+        var kind = extracted.Kind == "text" ? "" : $" ({extracted.Kind})";
+
+        var header = new StringBuilder(
+            $"{Path.GetFileName(path)}{kind} — characters {offset}–{end} of {text.Length}{lines}");
+        if (end < text.Length)
+            // Deliberately not "call again with offset=… to continue". That invites reading a whole file a window
+            // at a time, which puts every byte of it into the conversation anyway and defeats the window entirely.
+            // Searching is nearly always the actual intent: someone wanting one function, one error, one price.
+            // Paging is still available and still says where it stopped — it just stops being the suggestion.
+            header.Append($" ({text.Length - end} characters not shown. If you are looking for something specific, " +
+                          $"find_in_file will locate it; read_file with offset={end} continues from here if you " +
+                          "genuinely need the next stretch.)");
+        return ToolOutput.Ok($"{header}\n\n{window}");
+    }
+
+    // ---- file_summary -------------------------------------------------------------------------
+
+    /// <param name="rootDir">Where a bare file name is looked for. Without it only absolute paths resolve, which
+    /// is no use for a file handed to the job by name — the way every other tool here refers to one.</param>
+    public static AgentTool SummaryTool(
+        IModelProvider provider, string model, string name = "file_summary", string? rootDir = null)
+    {
+        return new AgentTool(
+            name,
+            "Reads a file and answers a question about it — or summarises it if no question is given. Takes the " +
+            "file's name as listed by list_files, or a full path. Text formats and PDFs.",
+            new[]
+            {
+                ToolParameter.String("path", "The file's name, or a full path.", required: true),
+                ToolParameter.String("question", "What to find out from the file. Omit to get a general summary.", required: false),
+            },
+            (args, ct) => SummaryAsync(args, provider, model, rootDir, ct));
+    }
+
+    /// <summary>
+    /// A name, resolved where the files actually are.
+    /// <para>
+    /// Everything else in this conversation refers to a file by name — list_files reports names, write_file takes
+    /// one, deliverables are named. Only this tool demanded a full path, so asking it about a file the job had
+    /// been given came back "there's no file at X" when the file was sitting right there.
+    /// </para>
+    /// </summary>
+    private static string ResolvePath(string path, string? rootDir)
+    {
+        if (string.IsNullOrWhiteSpace(rootDir) || Path.IsPathRooted(path) || File.Exists(path)) return path;
+
+        var candidate = Path.Combine(rootDir, Path.GetFileName(path));
+        return File.Exists(candidate) ? candidate : path;
+    }
+
+    private static async Task<ToolOutput> SummaryAsync(
+        ToolCallArguments args, IModelProvider provider, string model, string? rootDir, CancellationToken ct)
+    {
+        string path = ResolvePath(args.GetString("path").Trim(), rootDir);
+        string? rawQuestion = args.GetStringOrNull("question")?.Trim();
+        bool isSummary = string.IsNullOrEmpty(rawQuestion);
+        string question = isSummary ? "Summarise the main points of this document." : rawQuestion!;
+
+        var extracted = FileText.Extract(path);
+        if (!extracted.Ok)
+            return ToolOutput.DeadEnd(extracted.Reason ?? "Couldn't read that file.");
+        if (extracted.Text.Length == 0)
+            return ToolOutput.Ok($"'{Path.GetFileName(path)}' is empty — nothing to summarise.");
+
+        var chunks = WebResearch.Chunk(extracted.Text, size: 1200, overlap: 200);
+
+        if (isSummary)
+        {
+            // A summary is ONE model call. A small file goes in whole; a large one is distilled to an
+            // evenly-sampled digest that fits a single call's budget. The old path map-reduced the entire
+            // document — up to 16 sequential ~6k-token calls on a local backend that serialises requests,
+            // which is what turned a summary into minutes. Sampling keeps coverage (beginning→end) at a
+            // fraction of the cost.
+            bool sampled = extracted.Text.Length > SummaryBudgetChars;
+            string body = sampled ? BuildDigest(chunks, SummaryBudgetChars) : extracted.Text;
+            string note = sampled
+                ? " The text below is a set of excerpts sampled across a long document (gaps marked […])."
+                : "";
+
+            var singleRequest = new ModelRequest
+            {
+                Model = model,
+                SystemPrompt = "You are a concise summarizer. Write a clean, cohesive summary of the following document. " +
+                    "Focus on main topics, key decisions, metrics, and outcomes. Keep it brief and professional." + note,
+                Messages = new[]
+                {
+                    Message.User($"Document {Path.GetFileName(path)}:\n\n{body}\n\nWrite the summary:"),
+                },
+                Think = false,
+                RepeatPenalty = 1.0,
+                MaxOutputTokens = 500,
+                TurnTimeout = TimeSpan.FromSeconds(90),
+            };
+            try
+            {
+                var response = await provider.CompleteAsync(singleRequest, ct).ConfigureAwait(false);
+                var answer = response.Content?.Trim() ?? "";
+                return answer.Length > 0
+                    ? ToolOutput.Ok($"{answer}\n\n(source: {Path.GetFileName(path)})")
+                    : ToolOutput.Error($"Read '{Path.GetFileName(path)}' but couldn't produce a summary.");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return ToolOutput.Error($"Read '{Path.GetFileName(path)}' but couldn't summarise it: {ex.Message}");
+            }
+        }
+
+        // For a specific question, rank chunks by relevance using BM25 and take the top 5 excerpts.
+        var top = WebResearch.RankByQuestion(chunks, question, take: 5);
+        if (top.Count == 0) top = chunks.Take(4).ToList();
+        if (top.Count == 0)
+            return ToolOutput.Ok($"Read '{Path.GetFileName(path)}', but found no readable content to work from.");
+
+        var excerpts = new StringBuilder();
+        for (int i = 0; i < top.Count; i++)
+            excerpts.Append($"[Excerpt {i + 1}]\n{top[i]}\n\n");
+
+        var request = new ModelRequest
+        {
+            Model = model,
+            SystemPrompt =
+                "You answer using ONLY the excerpts provided from a document. Be concise, factual, and " +
+                "specific — quote concrete figures, names, or dates when they appear. If the excerpts don't " +
+                "contain the answer, say so plainly; do not invent anything.",
+            Messages = new[]
+            {
+                Message.User($"Question: {question}\n\nExcerpts from {Path.GetFileName(path)}:\n\n" +
+                             $"{excerpts.ToString().TrimEnd()}\n\nAnswer the question:"),
+            },
+            Think = false,
+            RepeatPenalty = 1.0,
+            MaxOutputTokens = 500,
+            TurnTimeout = TimeSpan.FromSeconds(60),
+        };
+
+        try
+        {
+            var response = await provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            var answer = response.Content?.Trim() ?? "";
+            return answer.Length > 0
+                ? ToolOutput.Ok($"{answer}\n\n(source: {Path.GetFileName(path)})")
+                : ToolOutput.Error($"Read '{Path.GetFileName(path)}' but couldn't produce an answer from it.");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            return ToolOutput.Error($"Read '{Path.GetFileName(path)}' but couldn't summarise it: {ex.Message}");
+        }
+    }
+
+    // ---- scoped write / list / send (thread-rooted) -------------------------------------------
+    //
+    // These three tools are each CONSTRUCTED bound to one directory (a single conversation's file area). They
+    // flatten any path to a bare file name under that root, so a worker holding them can only ever touch THIS
+    // conversation's files — never another thread's. That structural rooting (not a prompt rule) is the
+    // context-scoping boundary: a worker is handed tools for its own thread and has no handle to any other.
+
+    /// <summary>Reduce any caller-supplied path to a safe bare file name (no directories, no traversal),
+    /// sanitising characters the filesystem rejects. Combined with a fixed root, escaping is impossible.</summary>
+    private static string SafeFileName(string name) =>
+        CollapseStackedExtension(string.Concat(Path.GetFileName(name.Trim()).Select(c =>
+            Path.GetInvalidFileNameChars().Contains(c) ? '_' : c)));
+
+    /// <summary>
+    /// A file may only have the extension it ended up with.
+    /// <para>
+    /// write_file refuses HTML and says to write it as .md. Holding a name it had already chosen, a worker did
+    /// the most literal possible thing and produced <c>Holiday_Playbook_2027_Deck.html.md</c> — a markdown file
+    /// wearing the name of the deck it was told not to write, which then reached the user like that. The
+    /// instruction was followed exactly; the name was the part nobody checked.
+    /// </para>
+    /// <para>
+    /// So a stacked markup extension is collapsed to the real one. Only the handful that come from this
+    /// particular mistake, because plenty of doubled extensions are meant — <c>.tar.gz</c>, <c>.d.ts</c>,
+    /// <c>backup.2026.json</c> — and rewriting those would be a worse bug than the one being fixed.
+    /// </para>
+    /// </summary>
+    private static readonly string[] StackedMarkup = { ".html", ".htm", ".md", ".markdown", ".txt" };
+
+    private static string CollapseStackedExtension(string fileName)
+    {
+        var final = Path.GetExtension(fileName);
+        if (final.Length == 0) return fileName;
+
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var inner = Path.GetExtension(stem);
+        if (inner.Length == 0) return fileName;
+
+        bool bothMarkup =
+            StackedMarkup.Contains(final, StringComparer.OrdinalIgnoreCase) &&
+            StackedMarkup.Contains(inner, StringComparer.OrdinalIgnoreCase);
+
+        return bothMarkup ? Path.GetFileNameWithoutExtension(stem) + final : fileName;
+    }
+
+    /// <summary>write_file(name, content): author a text file in this conversation's area (create/overwrite).</summary>
+    public static AgentTool WriteFileTool(string rootDir, string name = "write_file")
+    {
+        return new AgentTool(
+            name,
+            "Writes a text file into THIS conversation's file area (creating it, or overwriting one of the same " +
+            "name). Use it to produce a document, note, or data file you can then send with send_file. The file " +
+            "stays scoped to this conversation.",
+            new[]
+            {
+                ToolParameter.String("name", "File name to write, e.g. \"summary.md\". Kept to this conversation.", required: true),
+                ToolParameter.String("content", "The full text content of the file.", required: true),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                if (fileName.Length == 0) return Task.FromResult(ToolOutput.Error("A file name is required."));
+                string content = args.GetStringOrNull("content") ?? "";
+
+                // A deck is not this tool's job, and asking nicely did not work: told three times over to use
+                // build_presentation, a worker hand-wrote HTML every time — once spending its whole run
+                // base64-encoding images into it. A refusal routes it in a way a description cannot.
+                if (fileName.EndsWith(".html", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.EndsWith(".htm", StringComparison.OrdinalIgnoreCase))
+                    return Task.FromResult(ToolOutput.DeadEnd(
+                        $"write_file doesn't write HTML. For something the user will look at — a deck, a " +
+                        "comparison, anything you would show someone — call build_presentation instead: it takes " +
+                        "the slides as markdown and handles the design, layout, paging and images for you. If you " +
+                        // Naming the corrected file rather than the rule: "write it as .md" was read as an
+                        // instruction to append, and produced Holiday_Playbook_2027_Deck.html.md.
+                        $"genuinely want a plain document, call write_file again with the name " +
+                        $"\"{Path.GetFileNameWithoutExtension(fileName)}.md\"."));
+                try
+                {
+                    Directory.CreateDirectory(rootDir);
+                    File.WriteAllText(Path.Combine(rootDir, fileName), content);
+                    return Task.FromResult(ToolOutput.Ok(
+                        $"Wrote {fileName} ({content.Length} chars) to this conversation. Send it with send_file(\"{fileName}\")."));
+                }
+                catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't write {fileName}: {ex.Message}")); }
+            });
+    }
+
+    /// <summary>edit_file(name, find, replace, all): change part of an existing conversation file by exact-text
+    /// replacement, instead of rewriting the whole thing with write_file. This is how a REVISION should be made —
+    /// a 30KB build script or HTML source costs a handful of small edits, not a full regeneration. The
+    /// <c>find</c> text must occur exactly once (so the edit is unambiguous) unless <c>all</c> is set; a 0- or
+    /// multi-match is reported back so the model can widen the anchor or read the file first.</summary>
+    public static AgentTool EditFileTool(string rootDir, string name = "edit_file")
+    {
+        return new AgentTool(
+            name,
+            "Edits an EXISTING text file in this conversation by replacing an exact snippet — use this for a " +
+            "revision instead of rewriting the whole file with write_file (much faster on a large source like a " +
+            "build script or HTML). Provide 'find' (an exact, unique snippet copied verbatim from the file — use " +
+            "read_file or find_in_file first to get it) and 'replace'. By default 'find' must match exactly once; " +
+            "set all=true to replace every occurrence (e.g. swapping a colour used throughout).",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the existing file to edit, e.g. \"build_playbook.py\".", required: true),
+                ToolParameter.String("find", "Exact text to find, copied verbatim from the file (include enough surrounding text to be unique).", required: true),
+                ToolParameter.String("replace", "Text to put in its place.", required: true),
+                ToolParameter.Boolean("all", "Replace every occurrence instead of requiring a single unique match. Defaults to false.", required: false),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                if (fileName.Length == 0) return Task.FromResult(ToolOutput.Error("A file name is required."));
+                string find = args.GetStringOrNull("find") ?? "";
+                if (find.Length == 0) return Task.FromResult(ToolOutput.Error("'find' is required — the exact text to replace."));
+                string replace = args.GetStringOrNull("replace") ?? "";
+                bool all = args.GetBool("all", false);
+
+                string fullPath = Path.Combine(rootDir, fileName);
+                if (!File.Exists(fullPath))
+                    return Task.FromResult(ToolOutput.Error(
+                        $"There's no file called \"{fileName}\" in this conversation. Use list_files to check the name, or write_file to create it."));
+                try
+                {
+                    string text = File.ReadAllText(fullPath);
+                    int first = text.IndexOf(find, StringComparison.Ordinal);
+                    if (first < 0)
+                        return Task.FromResult(ToolOutput.Error(
+                            $"That exact text wasn't found in {fileName}. Read it first (read_file or find_in_file) and copy the snippet verbatim — whitespace and case must match."));
+
+                    int count = 0; for (int i = first; i >= 0; i = text.IndexOf(find, i + find.Length, StringComparison.Ordinal)) count++;
+                    if (count > 1 && !all)
+                        return Task.FromResult(ToolOutput.Error(
+                            $"That text appears {count} times in {fileName}, so the edit is ambiguous. Include more surrounding text to make 'find' unique, or set all=true to replace every occurrence."));
+
+                    string updated = all
+                        ? text.Replace(find, replace)
+                        : string.Concat(text.AsSpan(0, first), replace, text.AsSpan(first + find.Length));
+                    File.WriteAllText(fullPath, updated);
+                    int delta = updated.Length - text.Length;
+                    return Task.FromResult(ToolOutput.Ok(
+                        $"Edited {fileName} ({count} replacement{(count == 1 ? "" : "s")}, {(delta >= 0 ? "+" : "")}{delta} chars). " +
+                        $"Re-run the build to regenerate the output, then send the result."));
+                }
+                catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't edit {fileName}: {ex.Message}")); }
+            });
+    }
+
+    /// <summary>find_in_file(name, query): locate text in a conversation file, returning matching lines WITH
+    /// their 1-based line numbers (and a small amount of context), so the model can pinpoint where to edit in a
+    /// large source without paging the whole thing through read_file. Case-insensitive substring search.</summary>
+    public static AgentTool FindInFileTool(string rootDir, string name = "find_in_file")
+    {
+        const int MaxHits = 50;
+        return new AgentTool(
+            name,
+            "Searches an existing conversation file for text and returns the matching lines with their line " +
+            "numbers — use it to find exactly where something is in a large file (a build script, HTML source) " +
+            "before editing it, instead of reading the whole file. Case-insensitive substring match.",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the file to search, e.g. \"playbook.html\".", required: true),
+                ToolParameter.String("query", "Text to look for (case-insensitive), e.g. a hex colour or a heading.", required: true),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                if (fileName.Length == 0) return Task.FromResult(ToolOutput.Error("A file name is required."));
+                string query = args.GetStringOrNull("query") ?? "";
+                if (query.Length == 0) return Task.FromResult(ToolOutput.Error("A 'query' to search for is required."));
+
+                string fullPath = Path.Combine(rootDir, fileName);
+                if (!File.Exists(fullPath))
+                    return Task.FromResult(ToolOutput.Error(
+                        $"There's no file called \"{fileName}\" in this conversation. Use list_files to check the name."));
+                try
+                {
+                    var lines = File.ReadAllLines(fullPath);
+                    var hits = new StringBuilder();
+                    int found = 0;
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        if (lines[i].IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        found++;
+                        if (found <= MaxHits) hits.Append($"{i + 1}: {lines[i]}\n");
+                    }
+                    if (found == 0)
+                        return Task.FromResult(ToolOutput.Ok($"No lines in {fileName} contain \"{query}\"."));
+                    var header = found > MaxHits
+                        ? $"{found} matching lines in {fileName} (showing first {MaxHits}; narrow the query):\n"
+                        : $"{found} matching line{(found == 1 ? "" : "s")} in {fileName}:\n";
+                    return Task.FromResult(ToolOutput.Ok(header + hits.ToString().TrimEnd()));
+                }
+                catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't search {fileName}: {ex.Message}")); }
+            });
+    }
+
+    /// <summary>A read-only file bucket mounted alongside a conversation's own files — e.g. a global company
+    /// area or a persona's brand kit. Its files are listed (with their real on-disk path) so a worker can read
+    /// them with read_file or reference them by path inside run_python; they are never writable or sendable
+    /// from here (writes always land in the conversation).</summary>
+    public sealed record FileMount(string Label, string Dir);
+
+    /// <summary>list_files(): the files in THIS conversation (shared in OR written here), plus any read-only
+    /// buckets mounted for this worker (a global area, the persona's brand kit). Conversation files are shown by
+    /// bare name (use them with write/send); bucket files are shown with their full path (read-only — reference
+    /// that path in read_file or run_python).</summary>
+    public static AgentTool ListFilesTool(string rootDir, IReadOnlyList<FileMount>? mounts = null, string name = "list_files")
+    {
+        bool hasMounts = mounts is { Count: > 0 };
+        string desc = hasMounts
+            ? "Lists the files available to you: THIS conversation's files (shared here or written here), plus " +
+              "read-only reference buckets (e.g. a brand kit). Conversation files are referred to by bare name; " +
+              "bucket files are read-only and shown with their full path — use that path with read_file or inside " +
+              "run_python (e.g. to place a logo). You cannot write to or send a bucket file."
+            : "Lists the files available in THIS conversation — files the user shared here and files you've " +
+              "written here. Only this conversation's files are ever visible; nothing from any other thread.";
+        return new AgentTool(
+            name,
+            desc,
+            Array.Empty<ToolParameter>(),
+            (_, __) =>
+            {
+                try
+                {
+                    var sb = new StringBuilder();
+                    var convo = Directory.Exists(rootDir)
+                        ? new DirectoryInfo(rootDir).GetFiles().OrderBy(f => f.Name).ToList()
+                        : new List<FileInfo>();
+                    // The directory is stated once, so a name here can be turned into a path when something
+                    // outside this toolset needs one. Uploading a photo to a web form is the case that forced
+                    // it: the browser reads files from disk itself and takes absolute paths, and a worker
+                    // holding only "PXL_1234.jpg" had no way to produce one — it tried building an empty File
+                    // in the page and fetching the bytes from an origin that wasn't there.
+                    sb.Append($"Files in this conversation (on disk at {rootDir}):\n");
+                    if (convo.Count == 0) sb.Append("- (none yet)\n");
+                    else foreach (var f in convo) sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
+
+                    if (hasMounts)
+                        foreach (var m in mounts!)
+                        {
+                            if (!Directory.Exists(m.Dir)) continue;
+                            var files = new DirectoryInfo(m.Dir).GetFiles("*", SearchOption.AllDirectories)
+                                .OrderBy(f => f.FullName).ToList();
+                            if (files.Count == 0) continue;
+                            sb.Append($"\n{m.Label} (read-only — reference by full path):\n");
+                            foreach (var f in files) sb.Append($"- {f.FullName} ({HumanSize(f.Length)})\n");
+                        }
+
+                    sb.Append("\nUse file_summary to read one by name, or find_in_file to search inside it.");
+                    return Task.FromResult(ToolOutput.Ok(sb.ToString().TrimEnd()));
+                }
+                catch (Exception ex) { return Task.FromResult(ToolOutput.Error($"Couldn't list files: {ex.Message}")); }
+            })
+        {
+            // Listing twice is not a repeat: the point of looking again is that something was written in between,
+            // and refusing the second look told a worker its own new file did not exist.
+            Repeatable = true,
+        };
+    }
+
+    /// <summary>send_file(name, caption): send one of THIS conversation's files back to the user. The
+    /// <paramref name="emit"/> callback hands the resolved path to the host (which uploads it into the
+    /// thread); it returns false if the file couldn't be queued.</summary>
+    public static AgentTool SendFileTool(string rootDir, Func<string, string?, bool> emit, string name = "send_file")
+    {
+        return new AgentTool(
+            name,
+            "Sends a file from THIS conversation back to the user (uploads it into the thread). Use the exact " +
+            "name shown by list_files. You can only send files that exist in this conversation — files the user " +
+            "shared here or that you wrote here.",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the file to send, exactly as shown by list_files.", required: true),
+                ToolParameter.String("caption", "Optional short message to send alongside the file.", required: false),
+            },
+            (args, _) =>
+            {
+                string fileName = SafeFileName(args.GetString("name"));
+                string path = Path.Combine(rootDir, fileName);
+                if (fileName.Length == 0 || !File.Exists(path))
+                    return Task.FromResult(ToolOutput.DeadEnd(
+                        $"There's no file called '{fileName}' in this conversation. Use list_files to see what's here."));
+                string? caption = args.GetStringOrNull("caption")?.Trim();
+                bool ok = emit(path, string.IsNullOrWhiteSpace(caption) ? null : caption);
+                return Task.FromResult(ok
+                    ? ToolOutput.Ok($"Sent {fileName} to the user.")
+                    : ToolOutput.Error($"Couldn't send {fileName} just now."));
+            });
+    }
+
+    private static string HumanSize(long bytes) => bytes switch
+    {
+        >= 1024 * 1024 => $"{bytes / (1024.0 * 1024.0):0.#} MB",
+        >= 1024 => $"{bytes / 1024.0:0.#} KB",
+        _ => $"{bytes} B",
+    };
+
+    // Distil a long document into excerpts that fit one summary call by sampling chunks evenly across it.
+    // Even spacing (always including the first chunk) gives coverage of the whole document — beginning,
+    // middle and end — rather than just the leading N characters, while keeping the prompt to one cheap call.
+    private static string BuildDigest(IReadOnlyList<string> chunks, int budgetChars)
+    {
+        if (chunks.Count == 0) return "";
+
+        int perChunk = chunks[0].Length > 0 ? chunks[0].Length : 1200;
+        int want = Math.Max(1, budgetChars / perChunk);
+        if (want >= chunks.Count)
+            return string.Join("\n\n", chunks);
+
+        var picked = new List<string>(want);
+        double step = (double)chunks.Count / want;
+        for (int i = 0; i < want; i++)
+            picked.Add(chunks[Math.Min(chunks.Count - 1, (int)(i * step))]);
+
+        return string.Join("\n\n[…]\n\n", picked);
+    }
+}

@@ -1,0 +1,5817 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using Smarty.Agents;
+using Smarty.Brain;
+
+namespace Smarty.Api;
+
+/// <summary>
+/// Optional overrides that re-target the orchestrator at a different surface without forking it. The web
+/// app passes nothing (every field null → current behaviour). Smarty.Slack passes a company-aware prompt,
+/// a project-free toolset, and a web-only worker toolset, so the SAME engine drives a Slack thread.
+/// </summary>
+public sealed class OrchestratorOptions
+{
+    /// <summary>Replaces the default personal-assistant system prompt (which is built around projects).</summary>
+    public string? SystemPrompt { get; init; }
+
+    /// <summary>Replaces the orchestrator's own toolset. Slack uses the project-free task tools
+    /// (<see cref="Orchestrator.TaskTools"/>), so the model never reaches for find_project/create_project.</summary>
+    public IReadOnlyList<AgentTool>? Tools { get; init; }
+
+    /// <summary>Builds the toolset a delegated worker runs with. Slack returns web-research only (no shell,
+    /// no memory) — safe to expose to a whole workspace. Null = the default shell + web + memory set.</summary>
+    public Func<TaskInfo, IReadOnlyList<AgentTool>>? WorkerTools { get; init; }
+
+    /// <summary>Relay a finished worker's result with the model THINKING (default false). On a thinking model
+    /// like qwen3, think:false doesn't stop the chain-of-thought — it just stops it being split out of the
+    /// content, so deliberation leaks into the reply. Slack sets this true so the reasoning goes to the
+    /// (ignored) reasoning channel and the posted message stays clean. The web app keeps false (faster).</summary>
+    public bool RevoiceThink { get; init; }
+
+    /// <summary>Per-inference time limit for an orchestrator turn (default 90s). A chat surface where the
+    /// model only decides tools + writes a short reply wants this shorter, so a spiralling turn is cut and
+    /// recovered quickly instead of burning the full 90s. Slack sets ~45s.</summary>
+    public TimeSpan? TurnTimeout { get; init; }
+
+    /// <summary>An optional planner. When set, a delegated worker's FIRST leg is sized up by a cheap gate, and
+    /// a complex task gets a plan — both built in the BACKGROUND (inside the task, never on the chat turn, so
+    /// the conversation can't hang) and seeded into the executor before it runs. Null = no planning (straight
+    /// to the worker), the current behaviour.</summary>
+    public TaskPlanner? Planner { get; init; }
+
+    /// <summary>Where the user is, as a line for the prompt. Called per turn, so a move is reflected next message.</summary>
+    public Func<string>? LocationNote { get; init; }
+
+    /// <summary>The current fix itself, for seeding a map question's pin with "here".</summary>
+    public Func<UserLocation?>? CurrentLocation { get; init; }
+
+    /// <summary>
+    /// Where finished runs are recorded, so a task can be picked up after the process that ran it has gone.
+    /// A restart empties <see cref="Session.Tasks"/>, and without this "continue task 3" gets "there's no task
+    /// 3" — even though every call it made and every result it got are sitting on disk.
+    /// </summary>
+    public ControlHub? Hub { get; init; }
+
+    /// <summary>Where a finished run's HOW is written down, so the next one doing the same kind of job starts
+    /// from what the last one worked out rather than from nothing.</summary>
+    public TaskHintStore? Hints { get; init; }
+
+    /// <summary>An optional supervisor that watches running workers and steps in when they thrash (a relentless
+    /// failing search): it nudges the worker to wrap up, or aborts a hopeless task. Null = no supervision.</summary>
+    public TaskWatchdog? Watchdog { get; init; }
+
+    /// <summary>Where delegated tasks get their own working directory (task.md + a files/ folder for the
+    /// user's attachments). Each task gets <c>&lt;WorkspaceRoot&gt;/&lt;session&gt;/&lt;taskId&gt;/</c>. Null =
+    /// no workspaces (no task.md, attachments aren't carried) — the original behaviour.</summary>
+    public string? WorkspaceRoot { get; init; }
+
+    /// <summary>Who's who across surfaces, so a room's participants resolve to people and the brain's audiences
+    /// line up between Slack, email and the web app. Null = an empty directory (every alias unknown), which
+    /// means unidentified rooms and therefore public-only recall.</summary>
+    public PeopleStore? People { get; init; }
+
+    /// <summary>Turns the links in a message into cards. Omit and links stay plain text.</summary>
+    public LinkPreviews? LinkPreviews { get; init; }
+
+    /// <summary>Lists a project keeps. Omit and the list tools aren't offered.</summary>
+    public ProjectListStore? Lists { get; init; }
+
+    /// <summary>
+    /// Which project a passing remark belongs to. Omit and the orchestrator asks the user instead of guessing.
+    /// </summary>
+    public ProjectRouting? Routing { get; init; }
+
+    /// <summary>What the assistant is called, read fresh each turn so naming it takes effect without a restart.</summary>
+    public Func<string>? Naming { get; init; }
+
+    /// <summary>Where a picture goes so it can be served back — shared with the tool channel.</summary>
+    public Func<byte[], string, string?>? Images { get; init; }
+
+    /// <summary>The folder those pictures land in.</summary>
+    public string? MediaDir { get; init; }
+
+    /// <summary>An optional persisted schedule store. When set, the orchestrator exposes schedule_task /
+    /// cancel_schedule, and a <see cref="Scheduler"/> fires due tasks back into their thread at their time
+    /// (a proactive nudge). Null = no scheduling (the tools report it's unavailable).</summary>
+    public ScheduleStore? Schedules { get; init; }
+
+    /// <summary>
+    /// The home page's panels. When set, the orchestrator exposes widget_create / widget_update / widget_remove
+    /// and is told what is currently on the page, so "track this flight for me" becomes something that is still
+    /// there tomorrow instead of a paragraph scrolled past.
+    /// </summary>
+    public WidgetStore? Widgets { get; init; }
+
+    /// <summary>
+    /// The library of panel KINDS. Searched before anything is built, so a second flight costs a parameter rather
+    /// than another build — which is the difference between a system that accumulates capability and one that
+    /// redoes the same work every time it is asked.
+    /// </summary>
+    public WidgetLibrary? WidgetKinds { get; init; }
+
+    /// <summary>
+    /// The things that arrive. When set, the assistant can be asked to WATCH for something rather than to find it out
+    /// now — and can start a conversation of its own when it happens.
+    /// </summary>
+    public FeedStore? Feeds { get; init; }
+
+    /// <summary>What is being watched for, and what to do about it.</summary>
+    public WatcherStore? Watchers { get; init; }
+
+    /// <summary>
+    /// Reads a feed. Set by the host, which owns the HTTP client and the browser.
+    /// </summary>
+    /// <remarks>
+    /// Handed in rather than built here so that publishing a feed can PROVE it first: the refusal for a feed that
+    /// reads nothing is the only thing standing between "watching" and "silently never firing".
+    /// </remarks>
+    public Func<Feed, CancellationToken, Task<FeedRead>>? ReadFeed { get; init; }
+
+    /// <summary>
+    /// Whether an internal feed name points at something that exists — the registries, asked at publish time.
+    /// </summary>
+    public Func<string, string?>? InternalFeedFault { get; init; }
+
+    /// <summary>Proact's record. Its three recording tools write here, and nothing else may.</summary>
+    public ProactStore? Proact { get; init; }
+
+    /// <summary>
+    /// The installed plugins' tools, built for a task.
+    /// </summary>
+    /// <remarks>
+    /// Handed in whole rather than filtered for, and the difference cost a live run to find. A persona declares which
+    /// capability blocks it wants, and Proact's are read/files/memory/web — so a plugin's tools were never in the set
+    /// at all, and a filter that keeps plugin tools kept nothing. You cannot whitelist your way to a tool nobody
+    /// offered.
+    /// </remarks>
+    public Func<TaskInfo, IReadOnlyList<AgentTool>>? PluginTools { get; init; }
+
+    /// <summary>
+    /// Whether an image url actually loads. An image goes on the timeline INLINE, so one that 404s is a broken-image
+    /// icon rather than a missing nicety — and this system has lost a day to one of those before.
+    /// </summary>
+    public Func<string, CancellationToken, Task<bool>>? ImageLoads { get; init; }
+
+    /// <summary>
+    /// Runs a finished panel's loader for real, so it is PROVED before it is published — the same bargain
+    /// <see cref="ReadFeed"/> makes for a feed, and for the same reason: a loader nobody has run is a guess, and a
+    /// guess on a timer is a panel that fails silently every five minutes.
+    /// </summary>
+    public Func<WidgetKind, IReadOnlyDictionary<string, string>, CancellationToken, Task<LoadResult>>? ProvePanel { get; init; }
+
+    /// <summary>
+    /// Look at a finished panel and judge it. Set by the host, which owns the screenshot and the vision model.
+    ///
+    /// <para>
+    /// Called at the end of a build so a panel is never declared finished on the strength of "the code compiled and the
+    /// data loaded" — both of which were true of the camera panel while it showed a broken-image icon.
+    /// </para>
+    /// </summary>
+    public Func<Widget, Task>? LookAtWidget { get; init; }
+
+    /// <summary>
+    /// The same look, with its verdict handed back rather than filed.
+    /// </summary>
+    /// <remarks>
+    /// A panel build's last state is a check, and a check whose answer goes into a log is a check the build cannot
+    /// act on. This returns what was seen and which part is at fault, so "it looks wrong" can send the build back to
+    /// the design and "it's the wrong club" can send it back to the source — the whole reason for looking.
+    /// </remarks>
+    public Func<Widget, string, CancellationToken, Task<LookVerdict?>>? CheckWidget { get; init; }
+
+    /// <summary>Optional specialist personas a delegated task can be routed to (software engineer, PM…). When
+    /// set, <c>delegate</c> accepts a <c>persona</c> and the roster is surfaced to the orchestrator. Null =
+    /// no personas (the persona arg is ignored), the current behaviour.</summary>
+    public PersonaStore? Personas { get; init; }
+
+    /// <summary>The capability registry backing personas — resolves a persona's capability ids into the tools a
+    /// worker runs with. Required for personas to actually add tools (else they're prompt-only).</summary>
+    public CapabilityRegistry? Capabilities { get; init; }
+
+    /// <summary>Integration credentials/config for capabilities, read from disk and NEVER shown to the model.</summary>
+    public IntegrationConfig? IntegrationConfig { get; init; }
+}
+
+/// <summary>
+/// The conversational layer — and the router/mediator at the centre of the system. The orchestrator
+/// is the single voice the user talks to; it can't run anything itself. Real work is done by capable
+/// background WORKERS (full <see cref="SmartyAgent"/>s with real tools) that it hands tasks to and then
+/// relays the results back from, conversationally. It is also a task manager: it can list, peek at,
+/// steer (message), and cancel the tasks it has running. Orchestrator + workers share one model.
+/// </summary>
+public sealed partial class Orchestrator
+{
+    private readonly IModelProvider _provider;
+    private readonly string _model;
+    private readonly string _ollamaBaseUrl;
+    private readonly Func<string> _workerSystem;
+    private readonly JsonSerializerOptions _json;
+    private readonly TrainingLog _log;
+    private readonly Memory _memory;
+    private readonly PeopleStore _people;
+    private readonly ProjectRouting? _routing;
+    private readonly ProjectStore _projects;
+    private readonly ProjectRunStore _runs;
+    private readonly ProjectListStore? _lists;
+
+    // Bound the per-turn tool loop: a turn may call a data tool (list/status), read the result, then
+    // voice it — but it must not spin.
+    private const int MaxTurnIterations = 4;
+
+    /// <summary>
+    /// How much text before a tool call can still be an announcement rather than an answer.
+    ///
+    /// <para>
+    /// Roughly two sentences. "Let me check the calendar and see what you've got on." is 52 characters; an answer
+    /// carries facts and doesn't fit. The line is drawn on length because the two things differ in what they
+    /// contain, and text written before the tool returned cannot legitimately contain much.
+    /// </para>
+    /// </summary>
+    private const int MaxPreambleLength = 200;
+
+    // Set SMARTY_TRACE=1 to log worker tool calls/results and the final result to stderr (debugging).
+    private static readonly bool TraceOn = Environment.GetEnvironmentVariable("SMARTY_TRACE") == "1";
+    private static void Trace(string msg) { if (TraceOn) Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {msg}"); }
+    private static string Snip(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : "…" + s[^max..]).Replace("\n", " ⏎ ");
+
+    public Orchestrator(string model, string ollamaBaseUrl, Func<string> workerSystem, JsonSerializerOptions json, TrainingLog log, Memory memory, ProjectStore projects, ProjectRunStore runs, OrchestratorOptions? options = null)
+    {
+        _provider = ModelRouting.Provider(model, ollamaBaseUrl);
+        _model = model;
+        _ollamaBaseUrl = ollamaBaseUrl;
+        _workerSystem = workerSystem;
+        _json = json;
+        _log = log;
+        _memory = memory;
+        _people = options?.People ?? new PeopleStore();
+        _routing = options?.Routing;
+        _projects = projects;
+        _runs = runs;
+        // A callback, because the name is chosen while the app is running — at setup, which happens after this is
+        // constructed. Read per turn so naming it never needs a restart to take effect.
+        _system = options?.SystemPrompt is { Length: > 0 } given
+            ? () => given
+            : () => OrchestratorSystem(options?.Naming?.Invoke() is { Length: > 0 } named
+                ? named
+                : "the user's assistant");
+        _workerToolsFactory = options?.WorkerTools;
+        _revoiceThink = options?.RevoiceThink ?? false;
+        Links = options?.LinkPreviews;
+        _lists = options?.Lists;
+        Images = options?.Images;
+        MediaDir = options?.MediaDir;
+        _planner = options?.Planner;
+        _locationNote = options?.LocationNote;
+        _hub = options?.Hub;
+        _hints = options?.Hints;
+        _here = options?.CurrentLocation;
+        _watchdog = options?.Watchdog;
+        _turnTimeout = options?.TurnTimeout ?? TimeSpan.FromSeconds(90);
+        _workspaceRoot = options?.WorkspaceRoot;
+        _schedules = options?.Schedules;
+        _widgets = options?.Widgets;
+        _kinds = options?.WidgetKinds;
+        _feeds = options?.Feeds;
+        _watchers = options?.Watchers;
+        _readFeed = options?.ReadFeed;
+        _internalFeedFault = options?.InternalFeedFault;
+        _proact = options?.Proact;
+        _imageLoads = options?.ImageLoads;
+        _pluginTools = options?.PluginTools;
+        _provePanel = options?.ProvePanel;
+        _lookAtWidget = options?.LookAtWidget;
+        _checkWidget = options?.CheckWidget;
+        _personas = options?.Personas;
+        _capabilities = options?.Capabilities;
+        _integrationConfig = options?.IntegrationConfig ?? new IntegrationConfig();
+
+        if (options?.Tools is { } overrideTools)
+        {
+            // A re-targeted surface (Slack) supplies its own toolset for both general and pinned modes —
+            // it has no projects, so the distinction collapses to one set.
+            _orchestratorTools = overrideTools.ToArray();
+            _pinnedTools = _orchestratorTools;
+        }
+        else
+        {
+            // The orchestrator's tools = task tools + global memory-access + project create/list (all executed
+            // in HandleToolCall by name).
+            // These are SCHEMAS only — HandleToolCall executes them by name against the live room, so the room
+            // callback here is never invoked. Passing Unknown makes that explicit rather than pretending.
+            // SCHEMAS only — HandleToolCall executes these by name, so the source callback here is never invoked.
+            var brainSchemas = MemoryTools.All(memory, memory.Graph, () => null, () => null);
+            // Cheap, read-only things the orchestrator can do for itself rather than delegate. Looking at an
+            // attached picture belongs here: it costs a fiftieth of a penny, answers in a second, and without it
+            // the orchestrator writes briefs about images it has never seen.
+            var seeing = options?.MediaDir is { Length: > 0 } || options?.Images is not null
+                ? new[] { Vision.Tool(options?.MediaDir ?? "") }
+                : Array.Empty<AgentTool>();
+            _orchestratorTools = OrchestratorTools
+                .Concat(brainSchemas)
+                .Concat(seeing)
+                // Pictures, for when the orchestrator is the one holding them — a finished job's files, or a url it
+                // already has. The worker gets its own copy of this; either half can be the one with the images.
+                .Append(GalleryTool.Create((pictures, ct) => Task.FromResult(new GalleryResult(pictures.Count, 0))))
+                .Append(ProjectTools.CreateTool(projects))
+                .Append(ProjectTools.TopicTool(projects))
+                .Append(ProjectTools.CompleteTool(projects))
+                .Append(ProjectTools.ListTool(projects))
+                .Append(ProjectTools.DatesTool(projects))
+                // A period that comes round again, rather than a project that ends: without this, "week of dinners"
+                // reads as finished every Sunday and anything built on it goes stale.
+                .Append(ProjectTools.RepeatTool(projects))
+                .Concat(options?.Lists is { } ls
+                    ? ProjectListTools.All(ls, () => null, Holds)
+                    : Array.Empty<AgentTool>())
+                .Concat(WidgetSchemas(options?.Widgets, options?.WidgetKinds))
+                .Concat(WatchSchemas(options?.Feeds, options?.Watchers))
+                .ToArray();
+            // A pinned project chat is already inside one project — no resolving, creating or listing projects.
+            _pinnedTools = OrchestratorTools.Where(t => t.Name != "find_project")
+                .Concat(brainSchemas)
+                .Concat(seeing)
+                // A project's own chat is the likeliest place to be asked to show its pictures.
+                .Append(GalleryTool.Create((pictures, ct) => Task.FromResult(new GalleryResult(pictures.Count, 0))))
+                .Concat(options?.Lists is { } pls
+                    ? ProjectListTools.All(pls, () => null, Holds)
+                    : Array.Empty<AgentTool>())
+                .Concat(WidgetSchemas(options?.Widgets, options?.WidgetKinds))
+                .Concat(WatchSchemas(options?.Feeds, options?.Watchers))
+                .ToArray();
+        }
+    }
+
+    private readonly AgentTool[] _orchestratorTools;
+    private readonly AgentTool[] _pinnedTools;
+    private readonly Func<string> _system;
+    private readonly Func<TaskInfo, IReadOnlyList<AgentTool>>? _workerToolsFactory;
+    private readonly bool _revoiceThink;
+
+    /// <summary>Builds the cards under a message that carries links. Optional: without it, links stay plain.</summary>
+    public LinkPreviews? Links { get; init; }
+
+    /// <summary>Stores an image and returns a URL for it — shared with the tool channel, so a picture in a deck is
+    /// served from the same place as a screenshot.</summary>
+    public Func<byte[], string, string?>? Images { get; init; }
+
+    /// <summary>Where those stored images sit on disk, so describe_image can read one back without a round trip.</summary>
+    public string? MediaDir { get; init; }
+    private readonly TaskPlanner? _planner;
+    private readonly Func<string>? _locationNote;
+    /// <summary>The current fix, so a place question can default its pin to where the user is.</summary>
+    private readonly Func<UserLocation?>? _here;
+    private readonly ControlHub? _hub;
+    private readonly TaskHintStore? _hints;
+    private readonly TaskWatchdog? _watchdog;
+    private readonly TimeSpan _turnTimeout;
+    private readonly string? _workspaceRoot;
+    private readonly ScheduleStore? _schedules;
+    private readonly WidgetStore? _widgets;
+    private readonly WidgetLibrary? _kinds;
+    private readonly FeedStore? _feeds;
+    private readonly WatcherStore? _watchers;
+    private readonly Func<Feed, CancellationToken, Task<FeedRead>>? _readFeed;
+    private readonly Func<string, string?>? _internalFeedFault;
+    private readonly ProactStore? _proact;
+    private readonly Func<string, CancellationToken, Task<bool>>? _imageLoads;
+    private readonly Func<TaskInfo, IReadOnlyList<AgentTool>>? _pluginTools;
+    private readonly Func<WidgetKind, IReadOnlyDictionary<string, string>, CancellationToken, Task<LoadResult>>? _provePanel;
+
+    /// <summary>Folders the user has granted access to. Named in the context so a panel can be built against one.</summary>
+    public SourceStore? Sources { get; set; }
+    private readonly Func<Widget, Task>? _lookAtWidget;
+    private readonly Func<Widget, string, CancellationToken, Task<LookVerdict?>>? _checkWidget;
+    private readonly PersonaStore? _personas;
+    private readonly CapabilityRegistry? _capabilities;
+    private readonly IntegrationConfig _integrationConfig;
+
+    /// <summary>The project-free task tools — delegate + task management, with no find_project /
+    /// create_project / project_summary. The toolset for a surface that doesn't use projects (Slack).</summary>
+    public static IReadOnlyList<AgentTool> TaskTools =>
+        OrchestratorTools
+            .Where(t => t.Name is not ("find_project" or "project_summary" or "project_runs" or "run_result"))
+            .ToArray();
+
+    // Project agent messages/tools into clean, training-shaped JSON (system + messages + tools → output).
+    private static object ProjectMessages(IEnumerable<Message> messages) =>
+        messages.Select(m => new
+        {
+            role = m.Role.ToString().ToLowerInvariant(),
+            content = m.Content,
+            reasoning = m.Reasoning,
+            tool_calls = m.ToolCalls?.Select(c => new { id = c.Id, name = c.Name, arguments = c.Arguments.ToString() }),
+            tool_name = m.ToolName,
+            tool_call_id = m.ToolCallId,
+        }).ToList();
+
+    private static object ToolSchemas(IReadOnlyList<AgentTool> tools) =>
+        tools.Select(t => new
+        {
+            name = t.Name,
+            description = t.Description,
+            parameters = t.Parameters.Select(p => new { name = p.Name, type = p.Type, description = p.Description, required = p.Required }),
+        }).ToList();
+
+    /// <summary>
+    /// The voice, with its own name in it.
+    /// </summary>
+    /// <remarks>
+    /// Built per install rather than baked in, because the person using it chooses what to call it — and being told its
+    /// name is what lets it answer to it. Still one fixed string for the life of a turn, so the cache behaves exactly as
+    /// it did when the name was a literal.
+    /// </remarks>
+    private static string OrchestratorSystem(string me) =>
+        $"You are {me}, the user's personal assistant — one warm, concise voice. You don't do work yourself: " +
+        "you hand it to background workers and relay what they find.\n" +
+        "\n" +
+        "A tool call is the only way to actually do something — never say you've done, saved, noted, booked, or " +
+        "checked something unless you called its tool in this reply.\n" +
+        "\n" +
+        // Each tool describes itself, and its description is in context on every turn — so what is left here is
+        // only the JUDGEMENT the descriptions cannot carry: when to reach for one, and what not to do with it.
+        // Six entries listing what cancel_task and project_summary do were a second copy of their own schemas.
+        "- delegate: start background work — any action, or anything live or real. Say one short line naming " +
+        "what you're doing (\"Checking the weather for the weekend\"); the result comes back later.\n" +
+        "- When the user refines, answers or iterates on work that already exists (\"make it cleaner\", \"try " +
+        "again\"), message_task it to that id — do NOT delegate it again. A finished task re-opens with " +
+        "everything it already found.\n" +
+        "- set_memory holds short durable facts — where they live, what they can't eat, the hotel chosen. NOT " +
+        "what a chat covered or what a task did: that is the run, and it is already recorded. Unsure it will " +
+        "matter next month? Don't save it. A project detail they simply tell you (a booking, a price, a " +
+        "decision) is a memory about that project, not a job to delegate.\n" +
+        // Acting on someone's behalf is not the same as deciding on their behalf. Asked to list a record at
+        // £150 — the only term given — it wrote a 30-day returns policy and enabled Best Offer, then stated
+        // both in the brief as though they were the user's decisions.
+        "- What they SAID is the spec. A detail they didn't give that carries a consequence — a price, a " +
+        "policy, a commercial term, who can see it — is not yours to choose. search_memory for a standing " +
+        "preference; if there isn't one, ASK. Never write an unmade decision into a task as though they made " +
+        "it: the worker will act on it as fact and they may never see it.\n" +
+        "- A message about ongoing work that doesn't name it (\"the flights\") needs find_project first; if " +
+        "nothing matches, ask. A project's real answers usually sit in a past run rather than its summary.\n" +
+        "- Two containers, and which one depends on whether there is an outcome to reach. create_project needs a " +
+        "GOAL — what finishing it would mean — and is refused without one. create_topic is for a subject they keep " +
+        "coming back to with nothing to finish: somewhere to file what they like, what they've decided, files and " +
+        "lists. Dates are optional for both and most have none. Creating either starts NO work. When the user says a " +
+        "project's goal has been reached, finish_project — never decide that yourself.\n" +
+        "\n" +
+        "You act on the user's behalf, and workers may reach their own applications, accounts and data. If they ask " +
+        "for something, delegate it — the worker finds out what's possible, not you. Never decline for lack of " +
+        "access. Images reach the user, so ask for the thing itself, never a description of it. Workers can also " +
+        "build a presentation the user opens and pages through, so for anything they'll compare or show someone, " +
+        "a deck is an option worth offering — and delegate it as one, since gathering pictures is part of the job " +
+        "rather than an afterthought.\n" +
+        "\n" +
+        "When the user attaches a file, the worker gets it automatically — just delegate what to do with it.\n" +
+        "Just answer (no tools) for chat or things you know. Reply in English, brief and human.";
+
+    /// <summary>Handle a user message: echo it, run the orchestrator turn, dispatch any delegated work.</summary>
+    public async Task HandleMessageAsync(Session session, string userText, CancellationToken ct,
+        string? userScope = null, string? userName = null, IReadOnlyList<Attachment>? attachments = null)
+    {
+        await session.TurnLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            Trace("[turn] user message received");
+            session.LastUserMessageAt = DateTimeOffset.UtcNow;
+            session.LastUserText = userText; // their words alone — what memory should be searched with
+            session.CurrentUserScope = userScope; // who's talking — drives per-user memory (null in the web app)
+            // Turn-scoped: pictures shown answering the last thing must not suppress a file attachment on the next.
+            session.ShowedPictures = false;
+            session.CurrentUserName = userName;
+            if (attachments is { Count: > 0 } && ThreadFilesDir(session) is { } filesDir)
+            {
+                CopyAttachments(filesDir, attachments);
+            }
+            // Hold the turn's attachments so delegate can copy them into the task workspace; the model sees a
+            // human-readable note (names/types, not raw paths — those are carried deterministically).
+            //
+            // Two ways they arrive, and only one of them comes in through this call. Slack hands them to the
+            // turn directly. The web app uploads first and the files are already waiting on the session, so an
+            // unconditional assignment here would wipe them a line before they were read — attachments sent
+            // from the browser would vanish, silently and every time. Assign only when this caller brought some;
+            // the `finally` below still clears them, so nothing carries into a later turn either way.
+            if (attachments is { Count: > 0 }) session.PendingAttachments = attachments;
+            // The user sees their own words. Everything we add for the model's benefit — what they attached, what
+            // projects are on the go — goes only into history.
+            //
+            // The attachment note used to be part of the emitted message, so sending a file printed "the user
+            // attached report.pdf, at …" into the conversation as though they had typed it. They know what they
+            // attached; the file itself is shown as a card. The note is for the model, which cannot see the card.
+            var attachmentNote = session.PendingAttachments is null
+                ? ""
+                : AttachmentNote(session.PendingAttachments);
+
+            // A document that arrives IS the instruction to keep it. Nothing here asks the model to decide that, because
+            // it does not: handed a boarding pass, it read the file, summarised it perfectly and recorded nothing, and the
+            // pass was gone with the turn's folder. Keeping what somebody hands over is the least a memory can do, and a
+            // model that has to remember to will not, reliably, forever.
+            //
+            // The user's own words go with it, because the sentence and the document settle each other — "here's my
+            // ticket" is thin, the ticket names the airports and the date, and the reconciler is shown both.
+            KeepWhatArrived(session, userText);
+
+            // Everything they say goes to the memory, whether or not the model thinks to file it.
+            //
+            // It used to depend entirely on the model calling set_memory mid-reply, and that turned out to be a coin
+            // toss: "I'm heading to Fonda with my wife next Friday at 6pm" was filed, "I have a dentist appointment on
+            // Thursday at 9.30am" got a friendly acknowledgement and was filed nowhere. Both were answered as though
+            // they had landed. A memory that keeps roughly half of what it is told is worse than one that keeps none,
+            // because you stop being able to tell which half.
+            //
+            // Nothing here judges whether the sentence says anything — that is the reconciler's job, and it is the only
+            // thing positioned to do it, since it alone sees the sentence against everything already known. Skipped when
+            // a document came too: KeepWhatArrived has already filed the same words WITH the file, and the file is the
+            // half that matters.
+            session.OverheardThisTurn = null;
+            if (_memory is not null && session.PendingAttachments is not { Count: > 0 }
+                && !string.IsNullOrWhiteSpace(userText))
+                session.OverheardThisTurn =
+                    _memory.Overhear(userText, Said(session), session.Room.Room.Key).Id;
+
+            EmitMessage(session, "user", userText);
+            session.History.Add(Message.User(userText + attachmentNote + ActiveProjectsNote()));
+
+            // Another turn has gone by. Anything that touches the focused project during this turn resets this to
+            // zero (see FocusProject), so it only climbs while the conversation is about something else — which
+            // is what eventually lets the focus go.
+            if (session.CurrentProject is not null) session.TurnsSinceProjectTouched++;
+
+            // The user-facing turn is where the real decisions live (which tools, answer-and-delegate,
+            // refine-vs-new, cancel). Let the model think here so it gets them right; re-voice
+            // turns stay think:false for speed. A pinned project chat uses the narrower, project-only toolset.
+            var tools = session.PinnedProject is null ? _orchestratorTools : _pinnedTools;
+            // The turn persists its own exchange (spoken text + tool calls + results) to session.History.
+            await RunOrchestratorTurnAsync(
+                session, session.History, tools, think: true, ct).ConfigureAwait(false);
+            Trace("[turn] orchestrator user-turn done (ack streamed)");
+        }
+        finally
+        {
+            session.PendingAttachments = null; // turn-scoped — never leaks into a later turn
+            session.TurnLock.Release();
+        }
+    }
+
+    /// <summary>Fire a scheduled task into its thread. The host re-attaches the session and refreshes the live
+    /// thread BEFORE calling this, so the frozen instruction runs against current context (a "check back and
+    /// note the decision" task sees what was decided meanwhile). Injected as a SYSTEM turn — no fake user echo —
+    /// and the orchestrator carries it out (delegating as needed); the result/file rides the sink into the
+    /// thread as a proactive nudge.</summary>
+    /// <returns>What it said, so the schedule can record what happened without anyone reading the thread.</returns>
+    /// <summary>
+    /// One yes-or-no question, answered by the model, with nothing else in the room.
+    /// </summary>
+    /// <remarks>
+    /// For a decision that is genuinely a reading rather than a test — is this arrival the sort of thing somebody is
+    /// watching for. No tools, no history, no thinking, a couple of tokens out: a judgement that happens per item has
+    /// to be the cheapest call in the system or nobody can afford to watch anything.
+    /// <para>Anything other than yes is no. Silence, an error and a hedge all mean "don't act on this".</para>
+    /// </remarks>
+    public async Task<bool> AgreesAsync(string question, CancellationToken ct)
+    {
+        try
+        {
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt = "Answer with one word: yes or no. Nothing else.",
+                Messages = new List<Message> { Message.User(question) },
+                Tools = Array.Empty<AgentTool>(),
+                MaxOutputTokens = 8,
+                TurnTimeout = TimeSpan.FromSeconds(20),
+                Think = false,
+            };
+
+            var sb = new StringBuilder();
+            await foreach (var ev in _provider.StreamAsync(request, ct).ConfigureAwait(false))
+                if (ev is ModelStreamEvent.Content c) sb.Append(c.Text);
+
+            return sb.ToString().TrimStart().StartsWith("yes", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex)
+        {
+            Trace($"[agrees] couldn't decide: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Something being watched for has happened. Open with it, in a conversation nobody has asked for yet.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The difference from a scheduled task is not the plumbing, it is who is speaking. A schedule is the assistant's
+    /// own note to itself and arrives in the conversation it was set in; this arrives out of nowhere, in a NEW
+    /// conversation, because the user has not said anything — the world has. So the opening has to carry all three
+    /// things at once: what happened, why it was being watched for, and what was asked to be done about it.
+    /// </para>
+    /// <para>
+    /// A system message rather than a message pretending to be the user's. Putting words in their mouth would be a lie
+    /// visible on the screen, and worse, the next turn would treat them as something they had said.
+    /// </para>
+    /// </remarks>
+    public async Task<string?> RunWokenAsync(Session session, Watcher watcher, Feed feed, FeedItem item)
+    {
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            Trace($"[watch] {watcher.Name} woke {session.Id} on \"{Snip(item.Title, 80)}\"");
+
+            var arrived = new StringBuilder();
+            arrived.Append($"--- what arrived ---\nfrom: {feed.Name}\ntopic: {item.Topic}\n");
+            if (item.Title is { Length: > 0 }) arrived.Append($"title: {item.Title}\n");
+            if (item.At is { } at) arrived.Append($"when: {at.ToLocalTime():ddd d MMM HH:mm}\n");
+            if (item.Url is { Length: > 0 }) arrived.Append($"url: {item.Url}\n");
+            if (item.Body is { Length: > 0 }) arrived.Append($"\n{item.Body}\n");
+
+            session.History.Add(Message.System(
+                $"YOU ARE STARTING THIS CONVERSATION. Something you were asked to watch for has happened, and the " +
+                "user has not said anything — they are not here yet, and this chat exists because of what arrived.\n" +
+                $"What you were watching for: {watcher.Name}\n" +
+                $"What you were asked to do when it did: {watcher.Do}\n\n" +
+                arrived + "\n" +
+                "Do it now. Delegate whatever needs doing, exactly as you would if they had asked — and if it needs " +
+                "nothing but telling them, tell them.\n" +
+                "Then open with ONE short line saying what happened and what you have done about it. They will read " +
+                "this cold, so it has to make sense with no question above it: lead with the thing that arrived, not " +
+                "with a greeting. Never mention watchers, feeds, or any of the machinery — say what happened.\n" +
+                "Only ask them something if you genuinely cannot proceed without a decision that is theirs."));
+
+            return await RunOrchestratorTurnAsync(
+                session, session.History, _orchestratorTools, think: true, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            session.TurnLock.Release();
+        }
+    }
+
+    public async Task<string?> RunScheduledAsync(Session session, string taskText, string? userScope = null, string? userName = null)
+    {
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            Trace($"[schedule] firing into {session.Id}: {Snip(taskText, 120)}");
+            session.CurrentUserScope = userScope;
+            session.CurrentUserName = userName;
+            session.History.Add(Message.System(
+                "A task you SCHEDULED earlier is now due. Carry it out NOW, using the conversation above as " +
+                "context (it may have moved on since you set this). Do it and report the outcome to the thread " +
+                "in one short, natural line — a proactive heads-up. If it involves producing a file, delegate the " +
+                "work (the worker authors it and it's handed to the user automatically). Don't " +
+                "ask the user to confirm — only stop if you genuinely can't proceed without a decision only they " +
+                "can make. Never mention scheduling, tasks, or any internal mechanics.\n\nScheduled task: " + taskText));
+            return await RunOrchestratorTurnAsync(
+                session, session.History, _orchestratorTools, think: true, CancellationToken.None).ConfigureAwait(false);
+        }
+        finally
+        {
+            session.CurrentUserScope = null;
+            session.CurrentUserName = null;
+            session.TurnLock.Release();
+        }
+    }
+
+    // Parse a Slack session id ("slack:<channel>:<threadTs>") into its channel + thread timestamp. False for
+    // any non-Slack session (e.g. the web app), which is how scheduling stays Slack-only for now.
+    private static bool TryParseSlackSession(string sessionId, out string channel, out string threadTs) =>
+        ScheduleStore.TryParseSlackSessionId(sessionId, out channel, out threadTs);
+
+    /// <summary>
+    /// Run one orchestrator "turn" as the user sees it (a single assistant message id), looping the model
+    /// only when it calls a tool that returns data it then needs to voice (list/status/cancel/message).
+    /// When run on the live session history, the turn persists its OWN exchange (spoken text + tool calls +
+    /// their results) so the model can see what it already did next turn. Run on a temp convo (the worker
+    /// re-voice), it persists nothing and the caller handles history. Returns the spoken text.
+    /// </summary>
+    /// <param name="silentFallback">
+    /// What to say if the model produces no spoken text at all. Supplied by the re-voice, which is holding a
+    /// finished answer from a worker: without it, a model that writes its whole reply into the THINKING channel
+    /// (DeepSeek does this; qwen3 doesn't, which is why the re-voice runs think:false) leaves the turn silent and
+    /// the user gets an apology on top of a perfectly good answer. Never apologise when there's an answer in hand.
+    /// </param>
+    private async Task<string> RunOrchestratorTurnAsync(
+        Session session, IReadOnlyList<Message> baseMessages, IReadOnlyList<AgentTool> tools, bool think,
+        CancellationToken ct, string? silentFallback = null)
+    {
+        // Window the history we send to the model (keeps recent turns + durable system seeds) so a long thread
+        // doesn't resend everything every turn. persistTurn below still keys off the ORIGINAL baseMessages
+        // reference, and this turn's new messages are appended to the full session.History — so trimming the
+        // PROMPT never loses real conversation.
+        var convo = new List<Message>(WindowForModel(baseMessages));
+
+        // Keep the big system prompt STATIC so its KV cache is reused every turn (lower time-to-first-token).
+        // The per-turn dynamic context — date, running tasks, and the user's profile — goes in a late block
+        // just before the latest message: the model still sees it, but the cacheable prefix stays intact.
+        // Surfacing the profile here also means personal facts (allergies, where they live) are ALWAYS in
+        // front of the model, so it doesn't have to decide to search for them.
+        // The stored user message has the projects note appended, so using it as the memory query searches for
+        // the projects every turn. Their own words, when we have them.
+        var appended = convo.LastOrDefault(m => m.Role == Role.User)?.Content ?? "";
+        var message = string.IsNullOrWhiteSpace(session.LastUserText) ? appended : session.LastUserText!;
+        // A pinned project chat is scoped entirely to its project: surface only the project's context (not the
+        // global user profile), and tell the model to stay on it. The general chat surfaces the user profile
+        // plus any soft project focus.
+        string profile, focus;
+        if (session.PinnedProject is not null)
+        {
+            profile = "";
+            focus = await PinnedProjectNote(session, message, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            profile = ProfileNote(session);
+            focus = await ProjectFocusNote(session, message, ct).ConfigureAwait(false);
+        }
+        // Location sits with the date: both change between turns, and both belong in the late block rather than
+        // the cacheable head of the prompt.
+        var whereabouts = _locationNote?.Invoke() is { Length: > 0 } where ? "\n" + where : "";
+        var dynamicContext = (DateContext() + whereabouts + profile + focus + RunningTasksNote(session) + WaitingTasksNote(session) + FinishedTasksNote(session) + ScheduledNote(session) + WidgetsNote() + WatchNote() + AsksNote() + ListsNote() + KindsNote() + SourcesNote() + FilesNote(session) + PersonaNote() + BrandsNote()).TrimStart();
+        if (dynamicContext.Length > 0)
+            convo.Insert(Math.Max(0, convo.Count - 1), Message.System(dynamicContext));
+
+        int msgId = session.NextMessageId();
+        session.CurrentMessageId = msgId; // so a task started this turn can be pinned to this message in the UI
+        session.Append("msg_start", Json(new { id = msgId, role = "assistant" }));
+
+        var spoken = new StringBuilder();
+        bool delegatedSomething = false;
+        string? delegatedTask = null; // the description of work just kicked off (for a contextual ack)
+        bool anyToolCalled = false; // any tool called across this whole user-turn (incl. earlier iterations)
+        bool nudgedNoTool = false;  // we re-prompt at most once if the model named a tool but didn't call it
+        bool nudgedTruncation = false; // we retry once if a turn ran out of budget / looped before a real reply
+        bool spokenFromModel = false; // did the spoken text come from the model inline (vs. a generated ack)?
+
+        // When this turn runs on the live history, we persist the WHOLE exchange below (tool calls + their
+        // results, not just the spoken line) — so next turn the model can see what it already did and won't,
+        // say, re-delegate work that's already running. A temp convo (re-voice) keeps the old behaviour.
+        bool persistTurn = ReferenceEquals(baseMessages, session.History);
+        int persistFrom = convo.Count;
+
+        for (int iter = 0; iter < MaxTurnIterations; iter++)
+        {
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt = _system(), // static → KV cache reused every turn; dynamic context is in `convo`
+                Messages = convo,
+                Tools = tools,
+                RepeatPenalty = 1.0,
+                MaxOutputTokens = 4096,
+                TurnTimeout = _turnTimeout,
+                Think = think, // user turns think (right tool choices); re-voice/status don't (speed)
+            };
+
+            var sentMessages = convo.ToList(); // exact input for this inference (before we append its output)
+            var turnText = new StringBuilder();
+            ModelResponse? final = null;
+            var streamFilter = new XmlStreamFilter();
+            await foreach (var ev in _provider.StreamAsync(request, ct).ConfigureAwait(false))
+            {
+                switch (ev)
+                {
+                    case ModelStreamEvent.Content c:
+                        turnText.Append(c.Text);
+                        spoken.Append(c.Text);
+                        spokenFromModel = true;
+                        string filteredText = streamFilter.Feed(c.Text);
+                        if (filteredText.Length > 0)
+                        {
+                            session.Append("content", Json(new { id = msgId, text = filteredText }));
+                        }
+                        break;
+                    case ModelStreamEvent.Reasoning r:
+                        session.Append("reasoning", Json(new { id = msgId, text = r.Text }));
+                        break;
+                    case ModelStreamEvent.Completed done:
+                        final = done.Response;
+                        break;
+                }
+            }
+            string flushedText = streamFilter.Flush();
+            if (flushedText.Length > 0)
+            {
+                session.Append("content", Json(new { id = msgId, text = flushedText }));
+            }
+            final ??= new ModelResponse();
+
+            _log.Interaction(new
+            {
+                ts = DateTimeOffset.UtcNow,
+                session = session.Id,
+                msg_id = msgId,
+                role = "orchestrator",
+                model = _model,
+                think,
+                system = request.SystemPrompt,
+                messages = ProjectMessages(sentMessages),
+                tools = ToolSchemas(tools),
+                output = new
+                {
+                    content = turnText.ToString(),
+                    reasoning = final.Reasoning,
+                    tool_calls = final.ToolCalls.Select(c => new { id = c.Id, name = c.Name, arguments = c.Arguments.ToString() }),
+                },
+                finish = final.Finish.ToString(),
+            });
+
+            var calls = final.ToolCalls;
+            if (turnText.ToString().Contains("<tool_call>"))
+            {
+                var availableTools = tools.ToDictionary(t => t.Name, StringComparer.OrdinalIgnoreCase);
+                if (TryExtractXmlToolCalls(turnText.ToString(), availableTools, out var xmlCalls, out var xmlCleaned))
+                {
+                    if (calls == null || calls.Count == 0)
+                    {
+                        calls = xmlCalls;
+                    }
+                    else
+                    {
+                        var merged = calls.ToList();
+                        merged.AddRange(xmlCalls);
+                        calls = merged;
+                    }
+
+                    var oldLen = turnText.Length;
+                    turnText.Clear();
+                    turnText.Append(xmlCleaned);
+
+                    if (spoken.Length >= oldLen)
+                    {
+                        spoken.Remove(spoken.Length - oldLen, oldLen);
+                        spoken.Append(xmlCleaned);
+                    }
+                }
+            }
+
+            // Truncation / loop recovery: the model ran past the token cap, timed out, or looped WITHOUT ever
+            // calling a tool — so the streamed text is a broken, half-finished fragment (often reasoning-style
+            // narration), not a real reply. A small thinking model can spiral like this on a trivial message
+            // with rich context, burning the whole budget on reasoning before it writes anything. Discard the
+            // fragment and retry once, telling it to answer directly and briefly. Done before the assistant
+            // message is added to the convo, so the broken fragment never pollutes the next attempt.
+            if (calls.Count == 0 && !nudgedTruncation && think
+                && final.Finish is FinishReason.Length or FinishReason.Loop or FinishReason.Timeout)
+            {
+                nudgedTruncation = true;
+                if (turnText.Length > 0)
+                {
+                    spoken.Remove(spoken.Length - turnText.Length, turnText.Length); // drop the broken fragment
+                    session.Append("content_cleared", Json(new { id = msgId })); // clear the partial; msg_end self-heals
+                }
+                // Note what it must NOT lose: the action. This used to say "no narrating what you're about to
+                // do, just say it", and a model that had run out of room halfway through deciding to delegate
+                // obeyed exactly — it produced a confident one-line "I'm on it", called nothing, and the turn
+                // ended. The user was told work had started and nothing had. Rescuing the silence is not worth
+                // much if it costs the thing the user actually asked for.
+                convo.Add(Message.System(
+                    "You ran out of room before finishing that turn — you over-thought it, so nothing has " +
+                    "happened yet and the user has seen nothing. If the message needs work doing, call the tool " +
+                    "for it NOW — that call is the only thing that starts anything, and saying you'll do it does " +
+                    "not. If no action is needed, answer in ONE short, direct line with no analysis."));
+                continue;
+            }
+
+            convo.Add(Message.Assistant(turnText.ToString(), final.Reasoning, calls.Count > 0 ? calls : null));
+
+            if (calls.Count == 0)
+            {
+                // Two failure shapes to rescue once (both deterministic, tool-agnostic):
+                // (a) the model emitted NO message to the user and called nothing — it dumped its reply into
+                //     reasoning and "stopped after thinking"; a turn with no words and no action is always broken.
+                // (b) it NAMED a tool (in reasoning/reply) but didn't call it — meant to act, forgot. (Skipped
+                //     when a tool was already called this turn, so a post-tool confirmation isn't nudged.)
+                string? nudge = null;
+                if (!nudgedNoTool)
+                {
+                    if (turnText.Length == 0)
+                        nudge = "Your reply had only internal reasoning — no message to the user and no tool " +
+                                "call, so nothing actually happened. If you meant to do something, call the " +
+                                "tool now; otherwise write your actual reply to the user.";
+                    else if (!anyToolCalled &&
+                             ReferencesUncalledTool(turnText.ToString(), final.Reasoning, tools) is { } named)
+                        nudge = $"You referred to the {named} tool but didn't actually call it, so nothing " +
+                                $"happened — and your previous text was NOT shown to the user. A tool call is " +
+                                $"the only way to do it — if you meant to, call {named} now. If you were only " +
+                                "chatting and no action was needed, reply to the user fresh — they haven't seen " +
+                                "anything yet.\n" +
+                                $"Your draft (for reference only — not shown): {turnText}\n" +
+                                "If the draft contained useful information, weave the key points into your " +
+                                "new reply naturally. Do NOT say \"as I mentioned\" or reference it as something " +
+                                "you already told them.";
+                }
+                if (nudge is not null)
+                {
+                    nudgedNoTool = true;
+                    if (turnText.Length > 0)
+                    {
+                        spoken.Remove(spoken.Length - turnText.Length, turnText.Length);
+                        session.Append("content_cleared", Json(new { id = msgId }));
+                        // The assistant message was already added (line 378) — remove it so the
+                        // model can't reference content that was cleared from the user's view,
+                        // and so the system nudge follows the user message directly.
+                        if (convo.Count > 0 && convo[^1].Role == Role.Assistant)
+                            convo.RemoveAt(convo.Count - 1);
+                    }
+                    convo.Add(Message.System(nudge));
+                    continue;
+                }
+                break;
+            }
+
+            anyToolCalled = true;
+            bool needAnotherTurn = false;
+            foreach (var call in calls)
+            {
+                var r = await HandleToolCall(session, call, ct).ConfigureAwait(false);
+                delegatedSomething |= r.WasDelegate;
+                if (r.DelegatedTask is not null) delegatedTask = r.DelegatedTask;
+
+                // Work was asked for, so what they said was a REQUEST — and a request is not a fact.
+                //
+                // This is the signal that was missing when everything said started being filed. Overhearing was meant
+                // to catch statements the model forgot to record, and it does; but an imperative is not a statement,
+                // and the reconciler has no way to tell them apart from the words alone. Asked to read "Try again" for
+                // facts, it finds one, and the graph gains a thing called "Try again" that the owner supposedly HAS.
+                // Every piece of junk in there arrived exactly this way: a turn that delegated work.
+                //
+                // Delegation is the tell, it is free, and it needs no judgement about prose: if the turn ended up
+                // commissioning a job, the words were an instruction. What the job LEARNS is filed afterwards by the
+                // run itself, which is the better record anyway — the outcome rather than the asking.
+                if (r.WasDelegate) ForgetWhatWasOverheard(session);
+                needAnotherTurn |= r.DataReturning;
+                convo.Add(Message.ToolResult(call.Id, call.Name, r.Text));
+            }
+
+            // The model spoke, then called a tool whose data it now has to voice. What it said before the call is
+            // either an announcement ("let me check that for you") or an answer it wrote before it had the facts.
+            //
+            // Both used to be deleted, because when it answers inline AND again after the tool you get the reply
+            // twice in one bubble ("Cleveland Street, FitzroviaCleveland Street, Fitzrovia"). That fixed the
+            // doubling by throwing away the announcement too — the user watched "let me check" appear and then be
+            // replaced, which reads as the assistant changing its mind about having spoken.
+            //
+            // They aren't the same thing, and length tells them apart because of what each one IS. An
+            // announcement is a sentence; it can be a sentence because it carries no facts. An answer written
+            // before the tool returned is longer AND is the model guessing — it did not have the data when it
+            // wrote it, so it is the version to lose, not the one to keep.
+            //
+            // So: an announcement gets to stand as its own finished message and the answer arrives as the next
+            // one, which is how a person would do it. A pre-emptive answer is still dropped.
+            // (Delegation acks aren't data-returning, so "On it" was never affected either way.)
+            if (needAnotherTurn && turnText.Length > 0)
+            {
+                if (turnText.Length <= MaxPreambleLength)
+                {
+                    CloseMessage(session, msgId, spoken.ToString());
+                    msgId = session.NextMessageId();
+                    session.CurrentMessageId = msgId; // a task started after the tool pins to the message that says so
+                    session.Append("msg_start", Json(new { id = msgId, role = "assistant" }));
+                    spoken.Clear();                    // the announcement is delivered; the answer starts fresh
+                    Trace($"[turn] preamble kept as msg {msgId - 1}; answer will be msg {msgId}");
+                }
+                else
+                {
+                    spoken.Remove(spoken.Length - turnText.Length, turnText.Length);
+                    session.Append("content_cleared", Json(new { id = msgId }));
+                }
+            }
+
+            if (!needAnotherTurn)
+                break; // the spoken text (ack / answer) stands; no tool data to relay
+        }
+
+        // The model often ACTS (delegates, or resumes/steers an existing task) with everything in its
+        // reasoning and NO spoken line, leaving the user staring at a blank. Rather than a fixed "On it.",
+        // generate one short CONTEXTUAL ack so they're told what's actually happening. The apology is the
+        // LAST resort — only when the turn took no action at all (the model just reasoned and the nudge
+        // didn't recover it). NEVER apologise for work that actually happened (e.g. a message_task that
+        // re-opened a task to refine it — that's a tool call, not a delegate, so it isn't caught above).
+        if (spoken.Length == 0)
+        {
+            string ack;
+            // A finished answer beats anything we could generate — and beats apologising over the top of it.
+            if (silentFallback is { Length: > 0 } relay && !string.IsNullOrWhiteSpace(relay))
+            {
+                ack = relay.Trim();
+                Trace("[turn] model said nothing spoken — relaying the worker's own answer verbatim");
+            }
+            else if (delegatedSomething)
+                ack = delegatedTask is not null
+                    ? await GenerateDelegateAckAsync(message, delegatedTask, ct).ConfigureAwait(false)
+                    : "On the case 🔍";
+            else if (anyToolCalled)
+                ack = await GenerateDelegateAckAsync(message, message, ct).ConfigureAwait(false);
+            else
+                ack = "Sorry — I trailed off there. Could you say that again?";
+            spoken.Append(ack);
+            session.Append("content", Json(new { id = msgId, text = ack }));
+        }
+
+        // Persist this turn's REAL exchange to history — the assistant's tool calls and their results, not
+        // just the spoken line. Without the call + result in history, the model can't see its own past
+        // actions next turn (e.g. that it already delegated the pub research) and re-does them. Reasoning is
+        // dropped to keep history lean; the transient dynamic-context block (before persistFrom) is excluded.
+        if (persistTurn)
+        {
+            for (int i = persistFrom; i < convo.Count; i++)
+            {
+                var m = convo[i];
+                if (m.Role == Role.Assistant)
+                {
+                    bool empty = string.IsNullOrWhiteSpace(m.Content) && (m.ToolCalls is null || m.ToolCalls.Count == 0);
+                    if (empty) continue; // a thinking-only turn with nothing to keep
+                    session.History.Add(Message.Assistant(m.Content, null, m.ToolCalls));
+                }
+                else if (m.Role == Role.Tool)
+                {
+                    session.History.Add(m); // tool result, paired to its call above
+                }
+                // skip Role.System — those are internal nudges/recovery prompts, not real conversation
+            }
+            // An ack/fallback we generated AFTER the loop isn't in any assistant message above — keep it so
+            // the thread reads naturally and the model knows what it told the user.
+            if (!spokenFromModel && spoken.Length > 0)
+                session.History.Add(Message.Assistant(spoken.ToString()));
+        }
+
+        CloseMessage(session, msgId, spoken.ToString());
+        return spoken.ToString();
+    }
+
+    /// <summary>
+    /// Finish one assistant message: publish its authoritative text and pull out any links worth a card.
+    ///
+    /// <para>
+    /// Carrying the complete text on msg_end lets the client snap to the final string — streamed deltas are
+    /// best-effort for the live "typing" feel, and this self-heals a dropped one without a refresh. Shared,
+    /// because a turn can now end more than one message and both of them need the same treatment: the first
+    /// version of the split left the announcement without its msg_end, so the client had a bubble it had been
+    /// told to start and never told to finish.
+    /// </para>
+    /// </summary>
+    private void CloseMessage(Session session, int msgId, string text)
+    {
+        session.Append("msg_end", Json(new { id = msgId, text }));
+        ShowWaitingPictures(session, msgId);
+        EnrichLinks(session, msgId, text);
+    }
+
+    /// <summary>
+    /// Attach any pictures found while working to the message just finished.
+    /// </summary>
+    /// <remarks>
+    /// After the text, so they read as belonging to it rather than arriving ahead of it. Emptied as it goes, so a second
+    /// message does not repeat the first one's pictures.
+    /// </remarks>
+    private void ShowWaitingPictures(Session session, int msgId)
+    {
+        object[] cards;
+        lock (session.WaitingPictures)
+        {
+            if (session.WaitingPictures.Count == 0) return;
+            cards = session.WaitingPictures.ToArray();
+            session.WaitingPictures.Clear();
+        }
+
+        session.Append("links", Json(new { id = msgId, links = cards }));
+        Trace($"[gallery] showed {cards.Length} picture(s) with message {msgId}");
+    }
+
+    /// <summary>The outcome of one orchestrator tool call: the text result, whether the model should voice
+    /// it next iteration, and whether it kicked off a background task.</summary>
+    private readonly record struct ToolResultInfo(string Text, bool DataReturning, bool WasDelegate, string? DelegatedTask = null);
+
+    private static ToolResultInfo Data(string text) => new(text, DataReturning: true, WasDelegate: false);
+
+    /// <summary>One short, natural, in-language line telling the user what was just kicked off — used when the
+    /// model delegated but said nothing itself. Generated from the task so it's specific, not generic filler.</summary>
+    private async Task<string> GenerateDelegateAckAsync(string userMessage, string task, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(userMessage),
+                Message.System(
+                    "You've just quietly started working on this for the user, in the background:\n" + task + "\n\n" +
+                    "Write your one line now — telling them you're going off to do it and NAMING the specific " +
+                    "thing (pull the subject straight from the task). In the SAME language as their message."),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                // A tight persona that forces a single clean chat line. Plain text (no schema — the schema made
+                // qwen emit malformed JSON that failed to parse) + think:false: fast, and the explicit "no
+                // reasoning, just the line" keeps the chain-of-thought out of the output.
+                SystemPrompt =
+                    "You are Smarty, a warm, witty teammate. Output ONLY a single short chat line (max ~14 words) " +
+                    "saying what you're going off to do, naming the specific thing. A little personality/banter is " +
+                    "good. No preamble, no quotes, no reasoning — and NEVER a limp \"On it\". Only the line.",
+                Messages = convo,
+                Think = false,
+                MaxOutputTokens = 60,
+                TurnTimeout = TimeSpan.FromSeconds(20),
+            };
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            var line = CleanAckLine(response.Content);
+            return line.Length > 0 ? line : "On the case 🔍"; // non-wet fallback (the line almost always lands)
+        }
+        catch
+        {
+            return "On the case 🔍";
+        }
+    }
+
+    // Take the model's ack down to one clean chat line: drop any stray <think> tags, keep the first non-empty
+    // line, strip wrapping quotes.
+    private static string CleanAckLine(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return "";
+        text = System.Text.RegularExpressions.Regex.Replace(text, "<think>.*?</think>", "",
+            System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        text = System.Text.RegularExpressions.Regex.Replace(text, "</?think>", "",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        var first = text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "";
+        return first.Trim().Trim('"', '\'', '`').Trim();
+    }
+
+    /// <summary>Execute one orchestrator tool call against the session's task registry / stores.</summary>
+    private async Task<ToolResultInfo> HandleToolCall(Session session, ToolCall call, CancellationToken ct)
+    {
+        // Worker tool calls are traced by the agent loop; the ORCHESTRATOR's own were not, so what it actually
+        // passed had to be inferred from what changed on disk afterwards. Diagnosing "it created the project but
+        // set no dates" took three round trips for want of this line.
+        Trace($"[orchestrator] {call.Name} {Snip(call.Arguments.Raw.ToString(), 220)}");
+
+        switch (call.Name.ToLowerInvariant())
+        {
+            case "delegate":
+            {
+                var desc = call.Arguments.GetStringOrNull("task");
+                if (string.IsNullOrWhiteSpace(desc))
+                    return Data("No task description was provided — ask the user what they'd like done.");
+                // delegate validates a project; it never creates one. In a pinned project chat, default the
+                // work to that project so the model doesn't have to name it.
+                var project = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(project)) project = session.PinnedProject;
+                if (!string.IsNullOrEmpty(project) && !_projects.Exists(project))
+                    return Data($"There's no project \"{project}\". Use find_project to resolve which one this is, " +
+                                "or create_project if it's genuinely new (confirm with the user first).");
+                // Optional persona routing: validate against the roster so a typo doesn't silently run unspecialised.
+                var persona = call.Arguments.GetStringOrNull("persona")?.Trim();
+                if (!string.IsNullOrEmpty(persona) && _personas is not null && _personas.Get(persona) is null)
+                    return Data($"There's no persona \"{persona}\". Available: " +
+                                $"{string.Join(", ", _personas.All.Select(p => p.Id))}. Use one of those, or omit persona.");
+                var task = StartTask(session, desc!.Trim(),
+                    string.IsNullOrEmpty(project) ? null : project,
+                    string.IsNullOrEmpty(persona) ? null : persona);
+                var tags = string.Concat(
+                    task.Project is null ? "" : $" (project: {task.Project})",
+                    task.Persona is null ? "" : $" (persona: {task.Persona})");
+                return new ToolResultInfo(
+                    $"Task #{task.Id} started in the background{tags}; its result will come back to you to relay.",
+                    DataReturning: false, WasDelegate: true, DelegatedTask: desc!.Trim());
+            }
+
+            case "find_project":
+            {
+                var (text, slug) = await ResolveProjectAsync(call.Arguments.GetStringOrNull("statement") ?? "", session.Room, ct).ConfigureAwait(false);
+                if (slug is not null) FocusProject(session, slug); // focus the conversation on the resolved project
+                return Data(text);
+            }
+
+            // A project's own history. Deliberately two steps: the list carries labels and ids only, so reading
+            // "what work has happened" costs a few tokens, and the write-up of one run is fetched when it's the
+            // one that matters. The steps inside a run — every tool call and result — are never offered; that is
+            // the worker's working-out, and it is both enormous and already spent.
+            case "project_runs":
+            {
+                var slug = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(slug)) slug = session.CurrentProject;
+                if (string.IsNullOrEmpty(slug))
+                    return Data("Which project? Resolve it with find_project first (or have the user name it), then ask again.");
+                if (_projects.Get(slug) is null)
+                    return Data($"There's no project \"{slug}\". Use find_project to work out which one, or list_projects.");
+
+                var runs = _runs.ForProject(slug);
+                if (runs.Count == 0) return Data($"No work has run on \"{slug}\" yet.");
+
+                var lines = runs.Select(r =>
+                    $"{r.Id} · {r.Title ?? Head(r.Task, 90)} · {r.Status} · finished {r.EndedAt.LocalDateTime:d MMM HH:mm}");
+                return Data($"Work run on \"{slug}\", newest first:\n{string.Join("\n", lines)}");
+            }
+
+            case "run_result":
+            {
+                var id = call.Arguments.GetStringOrNull("id")?.Trim();
+                if (string.IsNullOrEmpty(id)) return Data("Which run? Pass an id from project_runs.");
+
+                var run = _runs.Get(id);
+                if (run is null) return Data($"There's no run \"{id}\". List them with project_runs.");
+                if (string.IsNullOrWhiteSpace(run.Result))
+                    return Data($"Run {id} ({run.Title ?? Head(run.Task, 90)}) finished {run.Status} and left no write-up.");
+
+                return Data($"Run {id} — {run.Title ?? Head(run.Task, 90)} ({run.Status}, " +
+                            $"finished {run.EndedAt.LocalDateTime:d MMM HH:mm}):\n\n{run.Result}");
+            }
+
+            case "project_summary":
+            {
+                var slug = call.Arguments.GetStringOrNull("project")?.Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(slug)) slug = session.CurrentProject;
+                if (string.IsNullOrEmpty(slug))
+                    return Data("Which project? Resolve it with find_project first (or have the user name it), then ask again.");
+                var p = _projects.Get(slug);
+                if (p is null)
+                    return Data($"There's no project \"{slug}\". Use find_project to work out which one, or list_projects.");
+
+                FocusProject(session, slug); // stay focused on what we're reporting on
+                var facts = ProjectEdges(slug, session.Room);
+                var sb = new StringBuilder($"Project \"{p.Title}\"");
+                if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($" — {p.Description}");
+                sb.Append(".\n\n");
+
+                // The live facts ARE the state — always current. Report from these.
+                if (facts.Count > 0)
+                    foreach (var f in facts.OrderBy(f => f.Relation, StringComparer.Ordinal))
+                        sb.Append($"- {f.Relation}: {f.Value}{(string.IsNullOrWhiteSpace(f.Context) ? "" : $" ({f.Context})")}\n");
+                else
+                    sb.Append("Nothing recorded yet — it's only just been set up.");
+
+                var runs = _runs.CountFor(slug);
+                if (runs > 0) sb.Append($"\n\n({runs} background {(runs == 1 ? "task has" : "tasks have")} run for it.)");
+                return Data(sb.ToString().TrimEnd());
+            }
+
+            case "create_project":
+            case "create_topic":
+            {
+                // The tool's own callback is never run — these are schemas, and this switch is the implementation
+                // (see the note where the toolset is built). So a parameter added to the schema has to be picked
+                // up HERE too: the dates were arriving correctly from the model and being dropped on this line,
+                // which looked exactly like the model ignoring them. The goal is the same trap, and it is the one
+                // field the distinction rests on — dropped here, every project would be created goalless and the
+                // refusal would fire on writes the model had got right.
+                var filing = call.Name == "create_topic";
+                var (msg, newSlug) = _projects.Create(
+                    call.Arguments.GetStringOrNull("title") ?? "",
+                    call.Arguments.GetStringOrNull("description") ?? "",
+                    filing ? null : ProjectTools.ParseDay(call.Arguments.GetStringOrNull("starts_on")),
+                    filing ? null : ProjectTools.ParseDay(call.Arguments.GetStringOrNull("ends_on")),
+                    goal: call.Arguments.GetStringOrNull("goal"),
+                    filing: filing);
+                if (newSlug is not null)
+                {
+                    FocusProject(session, newSlug); // focus it, so details stated next land on the project
+                    _ = RegenerateSummaryAsync(newSlug);
+                }
+                return Data(msg);
+            }
+
+            case "finish_project":
+            {
+                // Same trap as create: the switch is the implementation, so a tool the model can see and this cannot
+                // dispatch is a tool it calls and is told doesn't exist.
+                var which = call.Arguments.GetStringOrNull("project") ?? "";
+                return Data(call.Arguments.GetBoolOrNull("reopen") == true
+                    ? _projects.Reopen(which)
+                    : _projects.Complete(which));
+            }
+
+            case "show_pictures":
+            {
+                // On the orchestrator as well as the worker, because either one can be the half holding the pictures.
+                // Asked to show photos a finished job had already saved, the orchestrator listed their names and said
+                // it could not render them — true, and only because this tool was not on its own toolset.
+                var asked = GalleryTool.Read(call.Arguments).Take(GalleryTool.Most).ToList();
+                if (asked.Count == 0) return Data("No pictures in that call — each one needs at least a url or a file name.");
+
+                var done = await ShowPicturesAsync(
+                    session, session.PinnedProject ?? session.CurrentProject, session.CurrentMessageId, asked, ct)
+                    .ConfigureAwait(false);
+
+                return Data(GalleryTool.Report(done));
+            }
+
+            case "list_projects":
+                return Data(_projects.List());
+
+            // The schemas above are built with no project in scope; here it is known, so the tools are rebuilt
+            // against the live one and invoked. Same code either way, which is the point of keeping them tools.
+            //
+            // Every list tool, taken from the same place the schemas came from. Naming them individually is what
+            // went wrong before: the orchestrator was OFFERED list_check when checklists were added and this case
+            // was never extended, so it could see the tool, call it, and be told the tool doesn't exist. A model
+            // handed a tool it cannot call has no way to recover — it has already done the right thing.
+            // Same shape as the list tools below, and for the same reason: named individually, the next one
+            // added is offered to the model and then refused when it calls it.
+            case { } widgetTool when widgetTool.StartsWith("widget_", StringComparison.Ordinal):
+            {
+                if (_widgets is null) return Data("The home page isn't set up on this instance.");
+                var live = new[]
+                    {
+                        WidgetTools.BuildTool(_widgets, () => session.Id,
+                            (w, shows) => BuildWidgetAsync(session, w, shows)),
+                    }
+                    .Concat(WidgetTools.Manage(_widgets));
+                var tool = live.FirstOrDefault(t => string.Equals(t.Name, widgetTool, StringComparison.Ordinal));
+                if (tool is null) return Data($"No such tool \"{widgetTool}\".");
+                var output = await tool.InvokeAsync(call.Arguments, ct).ConfigureAwait(false);
+                return Data(output.Content ?? "");
+            }
+
+            case "watch_for":
+            {
+                if (_feeds is null || _watchers is null)
+                    return Data("Watching isn't set up on this instance.");
+                var tool = FeedTools.WatchForTool((what, act) => WatchForAsync(session, what, act));
+                var output = await tool.InvokeAsync(call.Arguments, ct).ConfigureAwait(false);
+                return Data(output.Content ?? "");
+            }
+
+            case { } listTool when listTool.StartsWith("list_", StringComparison.Ordinal)
+                                  && listTool is not ("list_projects" or "list_tasks"):
+            {
+                if (_lists is null) return Data("Lists aren't set up on this instance.");
+
+                var slug = session.CurrentProject ?? session.PinnedProject;
+                var tool = ProjectListTools.All(_lists, () => slug, Holds)
+                    .FirstOrDefault(t => string.Equals(t.Name, call.Name, StringComparison.Ordinal));
+                if (tool is null) return Data($"No such tool \"{call.Name}\".");
+
+                var output = await tool.InvokeAsync(call.Arguments, ct).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(slug)) _ = RegenerateSummaryAsync(slug!);
+                return Data(output.Content ?? "");
+            }
+
+            case "list_tasks":
+            {
+                var all = OrderedTasks(session);
+                if (all.Count == 0) return Data("No tasks have been started yet.");
+                return Data(string.Join("\n", all.Select(t => $"#{t.Id} [{t.Status}] {t.Description}")));
+            }
+
+            case "task_status":
+            {
+                if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
+                var age = (DateTimeOffset.UtcNow - t.StartedAt).TotalSeconds;
+                var progress = string.IsNullOrWhiteSpace(t.LatestThought) ? "(no detail yet)" : t.LatestThought;
+
+                // Say what it IS, not "Running" whatever it is.
+                //
+                // This line read "Running 120s" for a finished task, a cancelled one, everything — the real status
+                // was tucked in brackets above and the sentence contradicted it. So the assistant told the user a
+                // completed job was "still going, gathering photos", and on the next reload announced it had just
+                // started again. A status tool that asserts the wrong status is worse than no status tool.
+                var state = t.Status switch
+                {
+                    "running" => $"RUNNING, {age:F0}s so far. Latest: {progress}",
+                    "waiting" => "WAITING on the user's answer — it is not working until they reply.",
+                    "cancelled" => "CANCELLED. It is not running and will not resume by itself.",
+                    "failed" => "FAILED and stopped. It is not running.",
+                    "done" => "FINISHED. It is not running — do not tell the user it is still going.",
+                    _ => $"status \"{t.Status}\" — not running.",
+                };
+                var line = $"#{t.Id} [{t.Status}] {t.Description}\n{state}";
+                if (t.Status == "done" && !string.IsNullOrWhiteSpace(t.Result))
+                {
+                    // In per-user/Slack mode the finished result is delivered by the worker's own re-voice, so a
+                    // status check that lands AFTER completion must NOT restate it (that's the stale "still
+                    // looking / here it is again" double). Elsewhere (web app) the status reply carries it.
+                    line += session.Id.StartsWith("slack:", StringComparison.OrdinalIgnoreCase)
+                        ? "\n(Finished — the result has already been posted in the thread. Don't repeat it; just confirm it's done if asked.)"
+                        : $"\nResult: {t.Result}";
+                }
+                return Data(line);
+            }
+
+            case "cancel_task":
+            {
+                if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
+                if (!t.IsRunning) return Data($"Task #{t.Id} is already {t.Status}.");
+                CancelTaskTree(session, t);
+                return Data($"Task #{t.Id} ({t.Description}) has been cancelled.");
+            }
+
+            case "message_task":
+            {
+                if (!TryResolve(session, call, out var t, out var miss)) return Data(miss);
+                var msg = call.Arguments.GetStringOrNull("message");
+                if (string.IsNullOrWhiteSpace(msg)) return Data("No message text was provided.");
+                // Resume from a stateless replay of the task's transcript when it isn't mid-flight:
+                //  • WAITING — paused on a question; this message is the answer.
+                //  • DONE / FAILED — finished, but the user is refining or retrying ("make it cleaner",
+                //    "try again"). Re-open it so the worker continues with ALL its prior context (the data it
+                //    loaded, the files it produced, the code it wrote) and just adjusts — instead of redoing
+                //    the whole job from scratch. The planning gate is skipped on a resume (transcript is
+                //    non-empty), so it picks up, not restarts.
+                //  • INTERRUPTED / CANCELLED — stopped from outside rather than by finishing. Interrupted is
+                //    what EVERY in-flight task becomes when the process restarts, and it is the state that most
+                //    obviously wants resuming: the work was cut off mid-way with everything it had learned still
+                //    recorded. Leaving these out meant the transcript was faithfully rebuilt and then refused —
+                //    "the previous task is stuck in an interrupted state and can't be resumed. Let me start it
+                //    fresh." — which is how a listing that was one field from done got restarted from nothing.
+                //    Cancelled is included because resuming is never automatic: it takes an explicit ask.
+                // A multi-discipline plan re-enters through its coordinator: the refine is routed to the step it
+                // touches (or appended as a new step) and cascades forward — keeping the whole change on one task
+                // and resuming the relevant step with full context, never starting the plan over.
+                if (t.Plan is not null && Resumable(t.Status))
+                {
+                    _ = Task.Run(() => RefinePlanAsync(session, t, msg!.Trim()));
+                    return new ToolResultInfo(
+                        $"Re-opened plan #{t.Id} with your change; it's picking up at the step that affects and carrying it forward.",
+                        DataReturning: false, WasDelegate: false);
+                }
+                if (Resumable(t.Status))
+                {
+                    bool reopen = t.Status is not "waiting";
+                    // fromUser: false — this is the orchestrator steering its own worker, not the user speaking.
+                    _ = Task.Run(() => AnswerTaskAsync(session, t, msg!.Trim(), fromUser: false));
+                    return new ToolResultInfo(
+                        reopen
+                            ? $"Re-opened task #{t.Id} with your note; it's resuming from where it left off with full context (not starting over)."
+                            : $"Answer passed back to task #{t.Id}; it's picking up where it left off.",
+                        DataReturning: false, WasDelegate: false);
+                }
+                if (!t.IsRunning) return Data($"Task #{t.Id} is {t.Status}; it can't take a message.");
+                t.Inbox.Enqueue(msg!.Trim());
+                return Data($"Message passed along to task #{t.Id}; it'll pick it up shortly.");
+            }
+
+            // Looking at a picture the user just sent is not doing the work — it is understanding the request.
+            //
+            // Asked "tell me about this model" with a screenshot attached, the orchestrator had only the file's
+            // NAME to go on, guessed that "model" meant a car, and wrote that guess into the brief as fact:
+            // "It appears to be a screenshot, likely of a car or some product." The worker looked, found a
+            // benchmark report for Gemini, and had to open by correcting the premise it had been handed.
+            //
+            // The hole was its eyes, so it gets eyes. On demand rather than on every attachment: most images
+            // need no describing, and the ones that do are exactly the ones it is about to write a brief about.
+            case "describe_image" when Images is not null || MediaDir is { Length: > 0 }:
+            {
+                var vision = Vision.Tool(MediaDir ?? "", ThreadFilesDir(session));
+                var looked = await vision.InvokeAsync(call.Arguments, ct).ConfigureAwait(false);
+                return Data(looked.Content);
+            }
+
+            case "promote_file":
+            {
+                var promoted = PromoteThreadFile(session,
+                    call.Arguments.GetStringOrNull("name")?.Trim() ?? "",
+                    call.Arguments.GetStringOrNull("scope")?.Trim() ?? "");
+                return Data(promoted.Ok
+                    ? $"{promoted.Detail} — it'll be available in future conversations. " +
+                      "Tell the user briefly it's saved; don't mention buckets or internals."
+                    : promoted.Detail);
+            }
+
+            case "schedule_task":
+            {
+                if (_schedules is null)
+                    return Data("Scheduling isn't available in this context.");
+                var when = call.Arguments.GetStringOrNull("when");
+                var taskText = call.Arguments.GetStringOrNull("task");
+                var repeat = (call.Arguments.GetStringOrNull("repeat") ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(taskText))
+                    return Data("To schedule something I need `task` (what to do), and either `when` (an absolute " +
+                                "time like 2026-06-26T14:27, or a relative \"in 25m\") or `repeat` (\"daily at 08:00\").");
+                if (repeat.Length > 0 && !ScheduleStore.TryParseRepeat(repeat, DateTimeOffset.Now, out _))
+                    return Data($"I couldn't read the recurrence \"{repeat}\". Use one of: \"hourly\", \"daily\", " +
+                                "\"weekly\", \"every weekday\", \"every N minutes/hours/days/weeks\", optionally " +
+                                "with a time (\"daily at 08:00\", \"weekly on monday at 09:00\").");
+
+                DateTimeOffset fireAt;
+                if (!string.IsNullOrWhiteSpace(when))
+                {
+                    if (!ScheduleStore.TryParseWhen(when!.Trim(), DateTimeOffset.Now, out fireAt))
+                        return Data($"I couldn't read the time \"{when}\". Give an absolute local time " +
+                                    "(e.g. 2026-06-26T14:27) or a relative one (\"in 25m\", \"in 2 hours\", \"in 3 days\").");
+                    if (fireAt <= DateTimeOffset.UtcNow.AddSeconds(5))
+                        return Data("That time is in the past. Give a time in the future.");
+                }
+                // A recurrence is enough on its own: "every morning at eight" already says when the first one is,
+                // and making the model compute that date as well is a second chance to get it wrong.
+                else if (repeat.Length > 0) ScheduleStore.TryParseRepeat(repeat, DateTimeOffset.Now, out fireAt);
+                else return Data("Give either `when` for a one-off or `repeat` for something recurring.");
+
+                // Slack addressing when it's a Slack thread; a web conversation needs none — its session id IS
+                // its address. This used to refuse anything that wasn't Slack, which is why the web app has had a
+                // scheduler sat behind it doing nothing for its entire existence.
+                TryParseSlackSession(session.Id, out var channel, out var threadTs);
+                var st = _schedules.Add(session.Id, channel, threadTs, taskText!.Trim(), fireAt,
+                    session.CurrentUserScope, session.CurrentUserName, repeat);
+                return Data($"Scheduled (#{st.Id}) for {fireAt.ToLocalTime():dddd d MMM, HH:mm}" +
+                            (repeat.Length > 0 ? $", repeating {repeat}" : "") +
+                            " — I'll act in this conversation then, nothing before. Tell the user briefly you'll " +
+                            "handle it at that time; don't restate any internals.");
+            }
+
+            case "cancel_schedule":
+            {
+                if (_schedules is null) return Data("Scheduling isn't available in this context.");
+                var id = call.Arguments.GetStringOrNull("id")?.TrimStart('#').Trim();
+                if (string.IsNullOrEmpty(id)) return Data("Which scheduled item? Use the id from the scheduled list.");
+                return Data(_schedules.Cancel(id)
+                    ? $"Cancelled scheduled item #{id}."
+                    : $"There's no pending scheduled item #{id}.");
+            }
+
+            case "search_memory":
+            {
+                // A question, not keywords, and it settles anything filed a moment ago before it answers — so the
+                // answer can never be older than the conversation.
+                var q = call.Arguments.GetStringOrNull("question") ?? call.Arguments.GetStringOrNull("query") ?? "";
+                if (q.Trim().Length == 0) return Data("Ask a question and I'll look it up.");
+
+                var r = await _memory.RecallAsync(q, session.Room.Room.Key, ct).ConfigureAwait(false);
+                Trace($"[brain] recall({Snip(q, 60)}) -> {Snip(r, 160)}");
+                return Data(r);
+            }
+
+            // Settling an identity question — two names that might be one thing. Executed through the tool object rather
+            // than reimplemented here: the brain tools are ADVERTISED from one list and EXECUTED from this switch, and a
+            // name that is in the first and missing from the second is a tool the model can see, call, and be told does
+            // not exist. Which is exactly what happened the first time this shipped — the model tried four times.
+            case "same_thing":
+            {
+                var settling = MemoryTools.Same(_memory.Graph);
+                var said = await settling.InvokeAsync(call.Arguments, ct).ConfigureAwait(false);
+                Trace($"[brain] same_thing -> {Snip(said.Content ?? "", 160)}");
+                return Data(said.Content ?? "");
+            }
+
+            case "forget_memory":
+            {
+                var what = call.Arguments.GetStringOrNull("statement") ?? call.Arguments.GetStringOrNull("what") ?? "";
+                if (what.Trim().Length == 0) return Data("Tell me what's no longer true.");
+
+                _memory.Forget(what, Said(session), session.Room.Room.Key);
+                Trace($"[brain] retracting {Snip(what, 80)}");
+                return Data("Noted as no longer the case, with the reason kept.");
+            }
+
+            case "set_memory":
+            {
+                // Filed, not written. Everything that used to happen here — picking a subject, choosing a key,
+                // deciding whether the thing already existed — was being asked of the participant least able to
+                // answer it: the model could not see what was already on file. It now says what it heard, in one
+                // sentence, and the reconciler resolves it against the whole graph a moment later.
+                //
+                // Which also means this costs nothing. It used to be the reason a turn recording three facts made
+                // three round trips, and the reason a run that "saved" something often hadn't.
+                var statement = call.Arguments.GetStringOrNull("statement")
+                                ?? call.Arguments.GetStringOrNull("value") ?? "";
+                if (statement.Trim().Length == 0) return Data("Nothing to record — say what you learned.");
+
+                // A document named alongside the sentence is kept with whatever the sentence turns out to be about.
+                // "Here's my ticket" is one thing being said, not two, and splitting it loses the file or the meaning.
+                var named = call.Arguments.GetStringOrNull("file");
+                if (named is { Length: > 0 } && FileInThread(session, named) is { Length: > 0 } path)
+                {
+                    _memory.Keep(statement, path, Path.GetFileName(path), Said(session), session.Room.Room.Key);
+                    Trace($"[brain] noting {Snip(statement, 60)} with {Path.GetFileName(path)}");
+                    return Data($"Noted, and I've kept {Path.GetFileName(path)} with it.");
+                }
+
+                // Replaces what was overheard from this turn rather than queueing a second reading of it. The model's
+                // wording is usually the better one — it resolves "Thursday at 9.30am" to a date — so it wins, and only
+                // one reconciliation happens.
+                _memory.Reword(session.OverheardThisTurn, statement, Said(session), session.Room.Room.Key);
+                session.OverheardThisTurn = null;
+                Trace($"[brain] noting {Snip(statement, 80)}");
+                return Data("Noted. It'll be filed against everything already known — carry on.");
+            }
+
+            default:
+                // Bad/hallucinated tool name — tell the model the real ones so it can correct itself, rather
+                // than guess again and burn iterations.
+                return Data($"There's no tool called '{call.Name}'. Available tools: " +
+                            $"{string.Join(", ", _orchestratorTools.Select(t => t.Name))}. Use one of those, " +
+                            "or just reply if no tool is needed.");
+        }
+    }
+
+    // Resolve a free-text statement ("what time are the flights next week") to the project it belongs to,
+    // by searching the projects' titles, descriptions and the facts recorded inside them. The hard rule:
+    // if it doesn't resolve confidently, we say so and tell the model to ASK — never to invent a project.
+    // Returns the message for the model AND the resolved slug (non-null only on a confident match, so the
+    // caller can focus the conversation on it). Ambiguous / no-match returns a null slug → the model asks.
+    private async Task<(string Text, string? Slug)> ResolveProjectAsync(string statement, BrainContext room, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(statement))
+            return ("Give me the user's statement and I'll work out which project it's about.", null);
+
+        var active = _projects.ActiveProjects();
+        if (active.Count == 0)
+            return ("There are no projects yet. If this is the start of a genuinely ongoing thing, ASK the user " +
+                    "before creating a project — don't assume.", null);
+
+        if (_routing is null)
+            return ("I can't work out which project that belongs to here — ask the user which one they mean.", null);
+
+        var ranked = await _routing.RankAsync(statement, active, ct).ConfigureAwait(false);
+        var top = ranked.Count > 0 ? ranked[0] : default;
+
+        // A clear winner: strong score and no near-rival.
+        if (ranked.Count > 0 && top.Score >= ResolveStrong &&
+            (ranked.Count < 2 || ranked[1].Score < ResolveStrong))
+            return ($"That's the project \"{top.Title}\" (slug: {top.Slug}) — matched on \"{top.Matched}\". " +
+                    "Use that slug.", top.Slug);
+
+        // Nothing close enough — don't guess, don't create.
+        if (ranked.Count == 0 || top.Score < ResolveWeak)
+            return ("No existing project matches that. Do NOT create one yourself — ask the user whether this " +
+                    "belongs to something they're already planning, or whether to start a new project for it.", null);
+
+        // In the ambiguous band (or two strong rivals): surface candidates and let the user decide.
+        var cands = ranked.Where(r => r.Score >= ResolveWeak).Take(3);
+        return ("Couldn't pin that to one project. It might be:\n" +
+                string.Join("\n", cands.Select(c => $"- {c.Slug}: {c.Title} (matched \"{c.Matched}\")")) +
+                "\nAsk the user which one it is — or whether it's something new.", null);
+    }
+
+    // Calibrated against nomic-embed-text, whose cosines have a compressed range: unrelated statements
+    // still sit ~0.42–0.51 (topical adjacency), while a genuine reference scores ~0.61+. So the bar for
+    // "confident" is 0.55 (true matches clear it, noise doesn't); anything below the weak floor is treated
+    // as no-match → ask the user. Biasing uncertainty toward "ask" is deliberate: never assume or invent.
+    private const double ResolveStrong = 0.55; // a confident statement→project match
+    private const double ResolveWeak = 0.52;    // below this, treat as "no match" (ask, don't guess)
+
+    /// <summary>Register a delegated task, announce it, and spawn its worker + status monitor.</summary>
+    private TaskInfo StartTask(Session session, string description, string? project = null, string? persona = null)
+    {
+        var task = new TaskInfo
+        {
+            Id = session.NextTaskId(),
+            Description = description,
+            Project = project,
+            Persona = persona,
+            UserScope = session.CurrentUserScope, // so the worker's memory writes attach to the right person
+            Room = session.Room,                  // the worker inherits the room, so its recall is scoped identically
+            UserName = session.CurrentUserName,
+        };
+        // Give the task its own workspace (task.md + any attached files), so the worker reads the brief and
+        // the user's files from one place. No-op when no workspace root is configured.
+        task.WorkspaceDir = CreateWorkspace(session, task, session.PendingAttachments);
+        session.Tasks[task.Id] = task;
+        task.OriginMessageId = session.CurrentMessageId;
+        session.Append("working", Json(new { id = task.Id, task = description, persona, msgId = task.OriginMessageId, at = DateTimeOffset.UtcNow }));
+        _ = Task.Run(() => RunWorkerAsync(session, task));
+        return task;
+    }
+
+    /// <summary>Run a freshly delegated task: start its worker from the task description.</summary>
+    private Task RunWorkerAsync(Session session, TaskInfo task)
+        => DriveWithHeartbeat(session, task, task.Description);
+
+    // Drive a TOP-LEVEL task's leg with a background PROGRESS HEARTBEAT alongside it: while the task runs, post
+    // a short "still on it" line into the thread on an exponential backoff (≈1, 2, 4, 8, 16, 32 min, then steady)
+    // so a long task never feels dead but also never spams. Several tasks run their own heartbeats independently,
+    // so each reports its own progress. Only top-level tasks go through here (a plan's hidden child steps call
+    // DriveWorker directly), so the user sees one heartbeat per thing they asked for, not per sub-step.
+    private async Task DriveWithHeartbeat(Session session, TaskInfo task, string message)
+    {
+        using var hbCts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token);
+        var beat = HeartbeatAsync(session, task, hbCts.Token);
+        try { await DriveWorker(session, task, message).ConfigureAwait(false); }
+        finally
+        {
+            hbCts.Cancel();
+            try { await beat.ConfigureAwait(false); } catch { /* best-effort */ }
+        }
+    }
+
+    // Emit a "progress" event for a running task, backing off exponentially. Surface-agnostic: the Slack sink
+    // renders it; the web app (no sink) is skipped entirely — it already shows live progress in its task overlay.
+    private async Task HeartbeatAsync(Session session, TaskInfo task, CancellationToken ct)
+    {
+        if (session.Sink is null) return; // web app — it has the live overlay; don't post heartbeat chatter
+        double minutes = 1;
+        try
+        {
+            while (task.Status == "running")
+            {
+                try { await Task.Delay(TimeSpan.FromMinutes(minutes), ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                if (ct.IsCancellationRequested || task.Status != "running") return;
+                session.Append("progress", Json(new
+                {
+                    id = task.Id,
+                    task = task.Description,
+                    note = CleanThought(task.LatestThought),
+                }));
+                minutes = Math.Min(minutes * 2, 32); // 1,2,4,8,16,32 then steady — never fully silent, never spammy
+            }
+        }
+        catch { /* progress is best-effort — never disturb the task */ }
+    }
+
+    // A short, clean snippet of the worker's latest thought/activity for a heartbeat: strip any leaked <think>
+    // tags, collapse whitespace, truncate. Empty when there's nothing useful to say yet.
+    private static string CleanThought(string? thought)
+    {
+        if (string.IsNullOrWhiteSpace(thought)) return "";
+        var t = System.Text.RegularExpressions.Regex.Replace(thought, @"</?think>", "",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        t = System.Text.RegularExpressions.Regex.Replace(t, @"\s+", " ").Trim();
+        return t.Length > 160 ? t[..160].TrimEnd() + "…" : t;
+    }
+
+    /// <summary>Resume a worker that paused to ask a question: feed the user's answer back in. The worker
+    /// re-runs seeded with its prior transcript, so it continues with full context (a clean, stateless
+    /// resume rather than a live suspended process). Safe to fire-and-forget.</summary>
+    /// <param name="fromUser">
+    /// True when the user themselves answered — their words belong in the chat as their own turn. False when the
+    /// ORCHESTRATOR is steering the task, which reaches this same method through message_task.
+    /// <para>
+    /// That distinction is the whole point of the flag. Both callers used to emit as "user", so an instruction the
+    /// orchestrator wrote to a worker — "the page didn't render, try fetching the raw HTML instead" — appeared in
+    /// the transcript as something the user had said. It read as words put in their mouth, it was recorded that way
+    /// in the history the model later reasons over, and it was reported three separate times before being found.
+    /// Steering is not a user turn: it happens between the assistant and its own worker, and the user sees the
+    /// result, not the instruction.
+    /// </para>
+    /// </param>
+    public async Task AnswerTaskAsync(Session session, TaskInfo task, string answer,
+        string? userScope = null, string? userName = null, IReadOnlyList<Attachment>? attachments = null,
+        bool fromUser = true)
+    {
+        if (userScope is not null) { session.CurrentUserScope = userScope; session.CurrentUserName = userName; }
+        if (fromUser) EmitMessage(session, "user", answer); // the answer shows in the chat like any user turn
+        // Files attached to the answer: drop them into this conversation's file area and tell the worker.
+        if (attachments is { Count: > 0 } && ThreadFilesDir(session) is { } filesDir)
+        {
+            var added = CopyAttachments(filesDir, attachments);
+            if (added.Count > 0)
+                task.Conversation.Add(Message.System(
+                    "The user has added these files to this conversation's files area: " +
+                    string.Join(", ", added) + ". List them with list_files; read them with read_file / file_summary."));
+        }
+        // A transcript rebuilt from a previous process needs saying out loud. Left unexplained, the worker reads
+        // its own last failure as the current state and concludes it is still stuck on something the user has
+        // since dealt with. Added once, on the leg that first uses the rebuilt history.
+        if (task.Rebuilt)
+        {
+            task.Conversation.Add(Message.System(ResumeNote));
+            task.Rebuilt = false;
+        }
+
+        // Pin the progress to the message that asked for it.
+        //
+        // A task rebuilt after a restart has no originating message — the one it was started from belongs to a
+        // process that is gone — so it emitted its progress against msgId -1, which is the "unknown" sentinel.
+        // The UI hangs the working pill off a message id, so -1 hangs it off nothing: the worker ran, uploaded
+        // photos, drove a whole listing, and the chat showed no sign of it. "It said it did but I can't see it
+        // did" is exactly what that looks like. The turn the user is reading is the right place for it.
+        if (task.OriginMessageId < 0) task.OriginMessageId = session.CurrentMessageId;
+
+        // The answer arrives with the question it answers.
+        //
+        // Without this it arrives as a bare line of text. The camera build asked for a username and password, got
+        // "admin/xxxx" back, and called github_list on it as though it were an owner/repo — a fair reading of two
+        // words and a slash with nothing around them. The question was in the CHAT, not in the worker's transcript,
+        // and after a restart the rebuilt transcript doesn't contain it at all: the pause is recorded separately
+        // from the steps. So the pair is stated outright, as a system line, which cannot be mistaken for either the
+        // model's own prose or a fresh instruction.
+        if (task.Pending is { } asked) task.Conversation.Add(Message.System(AnsweredNote(asked.Question)));
+
+        task.Pending = null;
+        task.Status = "running";
+        if (task.BuildsWidget is { Length: > 0 } answered) _widgets?.Asked(answered, null);
+        session.Append("working", Json(new { id = task.Id, task = task.Description, persona = task.Persona, msgId = task.OriginMessageId, at = DateTimeOffset.UtcNow }));
+        await DriveWithHeartbeat(session, task, answer).ConfigureAwait(false);
+    }
+
+    /// <summary>Drive a worker for one leg of a (possibly multi-leg, interactive) task: stream its progress,
+    /// then either pause on a question it asked, or finish — recording the run and re-voicing the result.
+    /// The worker is seeded with <see cref="TaskInfo.Conversation"/> (empty on the first leg, the accumulated
+    /// transcript on a resume) so it always has its full prior context.</summary>
+    private async Task DriveWorker(Session session, TaskInfo task, string message)
+    {
+        string result = "(no result)";
+        bool cancelled = false;
+        // Files uploaded to the user this leg, de-duped within the end-of-leg deliver pass.
+        var sentFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Snapshot (name → last-write) of the file area at the start of this leg, so a finalize that names no file
+        // can still fall back to the document(s) this leg actually produced.
+        var filesAtLegStart = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+        bool firstLeg = task.Conversation.Count == 0; // capture before the gate/seeds append to the transcript
+        Trace($"[worker #{task.Id}] drive: {Snip(message, 120)}");
+        try
+        {
+            // CLARIFY — before spending any work, check for a MATERIAL gap: a definition/scope/preference that
+            // would change the result and isn't already known. If so, ask ONCE and pause; the answer resumes the
+            // task and is saved so we never ask again. First leg + top-level only (never mid-task or per step).
+            if (_planner is not null && firstLeg && task.ParentTaskId is null)
+            {
+                task.LatestThought = "making sure the ask is clear…";
+                var known = KnownBeforeStarting(session, task);
+                var (clarifyQ, clarifyOpts) = await _planner.ClarifyAsync(task.Description, known, task.Cts.Token).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(clarifyQ) && task.Status == "running")
+                {
+                    // On resume, nudge saving a durable answer so this becomes a one-time question, not every time.
+                    task.Conversation.Add(Message.System(
+                        $"Before starting you asked the user to clarify: \"{clarifyQ}\". When they answer, if it's a " +
+                        "durable definition or preference you'll need again, set_memory it so you never ask again."));
+                    PauseWithQuestion(session, task, new PendingQuestion(clarifyQ!, clarifyOpts));
+                    return;
+                }
+            }
+
+            // ASSESS — top-level first leg only (a plan's child STEP already has its instruction). ONE sizing call
+            // answers both routing questions at once (was two): which disciplines the task needs, and whether it's
+            // complex enough to plan. MULTI-discipline → build a step plan and hand to the coordinator (never
+            // returns here). SINGLE → set that persona. Then, complex single-discipline work also gets a textual
+            // plan seeded so the executor follows a structured approach. Runs inside the background task, so it
+            // never slows the chat turn. Fails open (no disciplines, simple) so it can't block the work.
+
+            // WHAT WAS LEARNED LAST TIME — looked up before anything is decided, because a plan written without it
+            // plans the discovery all over again. The same shapes come round constantly (seven eBay listings, five
+            // Gmail sends in the recorded runs) and every one of them worked the procedure out from nothing.
+            // Matching is on words shared with the task, so an unfamiliar job matches nothing and costs nothing.
+            var matched = _hints?.Relevant(task.Description) ?? Array.Empty<TaskGuide>();
+            var guide = matched.Count > 0 ? TaskHintStore.Render(matched) : "";
+            if (matched.Count > 0)
+            {
+                // Named on the task so the end of the run can charge its failure to them, or clear their record.
+                foreach (var g in matched)
+                    if (!task.Guides.Contains(g.Name, StringComparer.OrdinalIgnoreCase)) task.Guides.Add(g.Name);
+                Trace($"[worker #{task.Id}] guides matched:{string.Concat(matched.Select(g => " " + g.Name))}");
+            }
+
+            // A panel build arrives WITH its plan — the brief is five numbered steps, and it names the tools for each
+            // one. Assessing it produced "complex", and planning it then spent 56 seconds restating the brief in the
+            // brief's own words: a minute of an eight-minute build, for nothing. Skipped for a task that already
+            // knows its shape.
+            if (task.BuildsWidget is { Length: > 0 } && !task.Assessed)
+            {
+                task.Persona ??= "software_engineer";
+                task.Assessed = true;
+                Trace($"[worker #{task.Id}] a panel build comes with its own plan — not planning it again");
+            }
+
+            // PROACT NEVER PLANS, and this is a safety property rather than an economy.
+            //
+            // A plan's child steps are fresh tasks, and a fresh task does not carry the Proact flag — so the moment
+            // an unattended run was assessed as "complex", its children arrived holding the full worker toolset,
+            // browser included, with nothing left of the one rule. It happened on the very first deep look that
+            // decided to act: "assess → complex; planning".
+            //
+            // The flag is propagated to children as well (see where they are built), because a boundary with one
+            // guard is a boundary with none. But the honest fix is here: nobody asked for this work, so it should be
+            // ONE worker doing ONE thing it can explain, not a tree of them. If it is too big for that, it is too
+            // big to be done unattended and belongs in a proposal.
+            if (task.Proact is { Length: > 0 } && !task.Assessed)
+            {
+                task.Assessed = true;
+                Trace($"[worker #{task.Id}] proact does one thing at a time — not planning it");
+            }
+
+            // A panel build does not run here at all any more. It is a fixed sequence of states — agree what it
+            // shows, draw it, find a source, prove it, bind it, check it — and this task is the coordinator that
+            // walks them. Each state is a child worker with its own brief and its own tools, so nothing that
+            // happens in one can spend another's budget.
+            if (task.PanelStates && task.BuildsWidget is { Length: > 0 } statePanel && _widgets is not null)
+            {
+                await DrivePanelBuildAsync(session, task, statePanel).ConfigureAwait(false);
+                result = task.Result ?? "(no result)";
+                return;
+            }
+
+            if (_planner is not null && !task.Assessed && task.ParentTaskId is null && task.Plan is null)
+            {
+                task.LatestThought = "sizing up the task…";
+                bool complex;
+                if (_personas is not null && task.Persona is null)
+                {
+                    var roster = PersonaRoster();
+                    var (rawDisciplines, isComplex) = await _planner.AssessTaskAsync(task.Description, roster, task.Cts.Token).ConfigureAwait(false);
+                    complex = isComplex;
+                    var disciplines = rawDisciplines.Where(id => _personas.Get(id) is not null)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    if (disciplines.Count > 1)
+                    {
+                        task.LatestThought = "planning the approach…";
+                        Trace($"[worker #{task.Id}] assess → multi-discipline: {string.Join(", ", disciplines)}");
+                        var plan = await _planner.PlanStepsAsync(task.Description, roster, task.Cts.Token, guide).ConfigureAwait(false);
+                        plan?.Steps.RemoveAll(s => _personas.Get(s.Persona) is null);
+                        if (plan is { Steps.Count: > 1 })
+                        {
+                            task.Plan = plan;
+                            await DrivePlanAsync(session, task, plan, null).ConfigureAwait(false);
+                            return;
+                        }
+                        Trace($"[worker #{task.Id}] assess → plan unusable; falling back to single worker");
+                    }
+                    else if (disciplines.Count == 1)
+                    {
+                        task.Persona = disciplines[0];
+                        Trace($"[worker #{task.Id}] assess → single discipline: {task.Persona}");
+                    }
+                }
+                else complex = await _planner.IsComplexAsync(task.Description, task.Cts.Token).ConfigureAwait(false);
+
+                if (complex)
+                {
+                    task.LatestThought = "planning the approach…";
+                    Trace($"[worker #{task.Id}] assess → complex; planning");
+                    var plan = await _planner.PlanAsync(task.Description, task.Cts.Token, guide).ConfigureAwait(false);
+                    if (!string.IsNullOrWhiteSpace(plan))
+                    {
+                        task.Conversation.Add(Message.System(
+                            "A plan has been prepared for this task. Follow it, adapting as you learn:\n\n" + plan));
+                        Trace($"[worker #{task.Id}] plan:\n{Snip(plan, 600)}");
+                    }
+                }
+                else Trace($"[worker #{task.Id}] assess → simple; no single-worker plan");
+                task.Assessed = true;
+            }
+
+            // CLOCK — deliberately NOT seeded into the transcript. It used to be added here, which put a
+            // minute-resolution timestamp at conversation position 0: ahead of the task, the tool results and
+            // everything else. Prompt caching is prefix matching, so that single line meant every task started a
+            // brand-new prefix and cached_tokens was flat zero — measured. It now rides the DRIVE MESSAGE
+            // (see NowLine below), which is the tail of the prompt, so the static head stays byte-identical
+            // across every task and the provider can actually reuse it.
+
+            // OPENING BRIEF — first leg only: where the worker's working directory is (the brief in task.md and
+            // any files the user attached, copied into files/), and what the last run of this shape of job
+            // learned. Done after the planning gate so it doesn't trip the gate's "first leg" check.
+            if (!task.Seeded)
+            {
+                var seed = new StringBuilder();
+                if (task.WorkspaceDir is { } ws)
+                {
+                    string? filesDir = ThreadFilesDir(session);
+                    seed.Append(
+                        $"You have a working directory for this task at: {ws}\n- The brief is in task.md.\n");
+                    if (filesDir is not null)
+                    {
+                        Directory.CreateDirectory(filesDir);
+                        seed.Append($"- This conversation's files are in: {filesDir}\n");
+                        seed.Append(
+                            "List them with list_files; read one with read_file / file_summary. Write a new file " +
+                            "with write_file, or revise one with edit_file (find_in_file to locate). Your finished " +
+                            "file is handed to the user automatically when you stop — you don't send it yourself. ONLY " +
+                            "files in this conversation are accessible — you cannot see files from anywhere else.\n");
+                    }
+                    seed.Append("Use run_shell_command too, if you have it. Write any output into this conversation's files area.");
+                    Trace($"[worker #{task.Id}] workspace note prepared: {ws}");
+                }
+                seed.Append(guide); // already begins with its own blank line, or is empty
+                task.OpeningNote = seed.Length > 0 ? seed.ToString() : null; // rides the drive message, not the head
+            }
+            task.Seeded = true; // clock + workspace context are in (or N/A); don't re-seed on a resume
+
+            // BRAND RESOLUTION — the branding designer works at an agency with many brands; pick which one this
+            // task is for (a client, or the house brand) so the right kit gets mounted below. First leg only;
+            // persists on the task so a refine stays on the same brand. Defaults to "house" so it never blocks.
+            if (task.Persona == "branding_designer" && string.IsNullOrEmpty(task.Brand) && _planner is not null)
+            {
+                task.Brand = await _planner.ResolveBrandAsync(task.Description, BrandSlugs(), task.Cts.Token).ConfigureAwait(false);
+                Trace($"[worker #{task.Id}] brand → {task.Brand}");
+            }
+
+            IModelProvider provider = ModelRouting.Provider(_model, _ollamaBaseUrl);
+            // If this task runs inside a project, inject that project's context and reframe memory toward
+            // tracking the project (not the user); writes are auto-tagged to the project's slug.
+            // A persona is a TIGHT bundle of blocks — it gets ONLY the blocks it declares (files/web/memory plus
+            // its capability functions), so a project_manager sees ticket tools + memory and nothing else. A task
+            // with NO persona (plain delegation) falls back to the surface's default worker set + file authoring.
+            List<AgentTool> tools;
+            var persona = task.Persona is { } pid ? _personas?.Get(pid) : null;
+            if (persona is not null)
+            {
+                // One tool per name, first one wins.
+                //
+                // Capabilities overlap: run_python belongs to both "data" and "images", file tools appear in
+                // "read" and "files". Nothing minded until a persona declared two blocks that shared a tool, and
+                // then the agent's own name-keyed lookup threw "An item with the same key has already been added:
+                // run_python" and every task under that persona failed outright. A persona is a bundle of
+                // capabilities, so overlap is the normal case and deduplicating is the assembler's job — not
+                // something each persona has to be authored around.
+                tools = persona.CapabilityIds
+                    .SelectMany(b => BuildBlock(b, session, task, provider))
+                    .GroupBy(t => t.Name, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.First())
+                    .ToList();
+
+                // A persona ADDS a specialism; it must not remove the ability to act.
+                //
+                // A persona is a closed set of blocks, which was fine while nothing ever selected one. The moment
+                // routing went live, "add my shopping list to an Ocado basket" was routed to product_manager —
+                // whose blocks are project_management + memory — and project_management contributes nothing
+                // without Jira configured. The worker arrived with four memory tools, no browser and no files, and
+                // correctly reported that it could not do anything. One imperfect routing decision should cost
+                // some specialisation, not the means to work at all.
+                //
+                // Shell stays out: that exclusion is about a tool with no shape, and is unrelated to this.
+                var missing = DefaultWorkerTools(session, task, provider)
+                    .Where(t => !tools.Any(existing => string.Equals(existing.Name, t.Name, StringComparison.OrdinalIgnoreCase)))
+                    .ToList();
+                tools.AddRange(missing);
+
+                // PROACT IS BOUNDED BY WHAT IT HOLDS, not by what it is told.
+                //
+                // Nobody asked for this work and nobody is watching it, so the rule that makes it safe to run
+                // unattended — prepare, never commit — cannot be a line in a brief. A worker holding a browser that
+                // can click and type, signed in as the user, can book a table; one that cannot click cannot, whatever
+                // it decides. So the toolset is cut down to a named list before the worker ever sees it, and what was
+                // taken away is traced, because a bounded worker should be able to say what it is not holding.
+                if (task.Proact is { Length: > 0 } proactMode)
+                {
+                    var offered = tools.Select(t => t.Name).ToList();
+                    tools = tools.Where(t => Proact.Keep(t.Name)).ToList();
+
+                    // The user's own devices and services, ADDED rather than filtered for — see PluginTools. A
+                    // vacuum it cannot ask about is a vacuum it can never notice has not run.
+                    //
+                    // Every command, not a read-only subset: a deliberate decision by the owner of the machine after
+                    // the narrower option was put to them. These are their own devices and their own plugins, and the
+                    // hard limits are untouched — nothing that sends, buys or books arrives through a plugin.
+                    if (_pluginTools?.Invoke(task) is { Count: > 0 } theirs)
+                        tools.AddRange(theirs.Where(t =>
+                            !tools.Any(have => string.Equals(have.Name, t.Name, StringComparison.OrdinalIgnoreCase))));
+                    tools.Add(ProactTools.NoticedTool(_proact!, proactMode, _imageLoads));
+                    tools.Add(ProactTools.PreparedTool(_proact!, proactMode, _imageLoads));
+                    tools.Add(ProactTools.ProposeTool(_proact!, proactMode, _imageLoads));
+                    // The read half of the user's own lists, which nothing else provides: every list tool in the
+                    // system is a write, so an unattended run had no way to see what was already on one.
+                    if (_lists is not null && _projects is not null)
+                        tools.Add(ProactTools.TheirListsTool(_lists, _projects));
+
+                    if (Proact.Dropped(offered) is { Count: > 0 } withheld)
+                        Trace($"[proact] worker #{task.Id} may not: {string.Join(",", withheld)}");
+                }
+
+                // A panel build gets the tools a panel build uses, and not the other thirteen.
+                //
+                // Given all forty, a build asked to show the user's own pictures spent four minutes port-scanning
+                // localhost from the browser and then read this repository's own C# on GitHub looking for an answer.
+                // Neither is a route to a panel, and neither would have been reached for if the tools had not been
+                // sitting there. Fewer tools is also a shorter prompt on every turn, and the turns are where the
+                // eight minutes went.
+                if (task.BuildsWidget is { Length: > 0 })
+                {
+                    var offered = tools.Count;
+                    // An adjust keeps every panel tool — it has to be able to publish what it changed — but it
+                    // has no more business with a browser than the design state does. Without this it fell to
+                    // the whole-build set and arrived holding all of Chrome for a job that edits JSX, and used
+                    // it: two minutes of opening tabs before it read its own brief.
+                    var kept = task.AdjustsWidget
+                        ? tools.Where(t => PanelBuild.KeepForAdjust(t.Name, BuildTools)).ToList()
+                        : tools.Where(t => PanelBuild.Keep(t.Name, BuildTools, task.PanelStep)).ToList();
+                    // Only if the set survives at all: a persona whose tools are all renamed one day should lose
+                    // the trim, not the ability to work. For one STATE of a build that means its own closing tool —
+                    // the state that cannot call panel_source is not a research state, it is a worker with a browser.
+                    var closes = task.AdjustsWidget ? "widget_publish" : PanelBuild.Ends(task.PanelStep) ?? "widget_publish";
+                    if (kept.Any(t => t.Name.Equals(closes, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        tools = kept;
+                        Trace($"[worker #{task.Id}] a panel build needs {tools.Count} of those {offered}");
+                    }
+                }
+
+                Trace($"[worker #{task.Id}] persona '{persona.Id}' → {tools.Count} tools " +
+                      $"({missing.Count} from the base set): {string.Join(",", tools.Select(t => t.Name))}");
+            }
+            else
+            {
+                // No shell in the default set, deliberately.
+                //
+                // It was the only tool with no shape and no cost, so it became the answer to everything: asked to
+                // send an email it grepped the disk for SMTP settings, asked for photos it hand-rolled downloads in
+                // PowerShell nine times, then base64-encoded an image until the context ran out. Every one of those
+                // is something another tool does properly — download_file, the browser, the file tools — and having
+                // a sink to fall into is what stopped it reaching for them.
+                //
+                // A persona that genuinely needs a shell declares the "shell" capability and gets one. The default
+                // worker, which is what runs most tasks, does not.
+                tools = _workerToolsFactory?.Invoke(task).ToList()
+                        ?? DefaultWorkerTools(session, task, provider);
+            }
+
+            // A worker running inside a project can WRITE to it. It couldn't, and the failure was silent and
+            // convincing: asked to "update the Dinners project to match the plan", the worker had file tools, a
+            // browser and no way whatsoever to record a fact — so it did the only thing left and wrote prose
+            // saying it had. The run reported done, the orchestrator relayed "all tracked", and the project was
+            // untouched. Anything asked to change a project needs the means to change it.
+            // Its LISTS — and NOT the memory. A worker asked to fill in a project's list needs the means, or it writes
+            // the week's dinners into a markdown file nothing reads and reports success, which is what used to happen.
+            //
+            // The memory is deliberately not here. A worker is the worst judge of what is worth remembering: it holds the
+            // page it just read and knows nothing about what its owner cares about, so given set_memory it filed the
+            // Instagram handle of a restaurant, a menu page's status code, and the fact that it had published a panel.
+            // The orchestrator sees the run's RESULT, and the conversation, and is the half that will need the fact
+            // later — so filing is its job now. Which also retires the whole apparatus that used to prune what runs
+            // filed after the fact.
+            // A TICKED PROPOSAL MUST BE ABLE TO DO WHAT WAS PROPOSED, and here it could not.
+            //
+            // These tools were given only to a task with a project set, which is right for ordinary work: a run
+            // scoped to one project writes to that project's lists and no others. A ticked proposal has no project,
+            // so it got none of them — and Proact's commonest and safest offer is "add this to your list".
+            //
+            // Which is exactly what happened. It found a new restaurant, offered to add it to their Dinner spots
+            // list, they clicked yes, and the run came back asking WHERE THE LIST LIVED: "I couldn't find it in the
+            // task directory or this conversation's files." An honest answer from a worker holding no tool that
+            // could see a list. The offer had been made by the half of the system that has `read_their_lists` and
+            // carried out by the half that does not, and nothing checked that the promise was keepable.
+            //
+            // Unscoped for the tick, the same way the top-level assistant holds them, because the executor has to
+            // FIND the list the proposal named rather than being handed one in advance.
+            if ((!string.IsNullOrEmpty(task.Project) || task.Ticked) && _lists is not null)
+            {
+                tools.AddRange(ProjectListTools.All(_lists, () => task.Project, Holds));
+                if (task.Ticked) tools.Add(ProactTools.TheirListsTool(_lists, _projects));
+            }
+
+            // Guides on request, on top of the ones the task's own wording matched.
+            //
+            // The automatic lookup runs once and scores on shared words, which is the right default and cannot
+            // ever match a job that turns out to be something other than what it was called: "sort out the spare
+            // Switch" shares nothing with "list an item on eBay". Three steps in, the worker knows which job it
+            // is doing and the store does not. Only added when there is something in it to ask for.
+            if (_hints is not null && _hints.Names().Count > 0)
+                tools.Add(TaskGuideTools.Tool(_hints, name =>
+                {
+                    if (!task.Guides.Contains(name, StringComparer.OrdinalIgnoreCase)) task.Guides.Add(name);
+                }));
+
+            // Whichever path assembled them, the worker gets one tool per name. The agent keys its lookup on the
+            // name and throws on a duplicate, which fails the whole task rather than the offending tool — far too
+            // harsh a punishment for two capabilities that happen to share a helper.
+            tools = tools
+                .GroupBy(t => t.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+
+            // Snapshot the file area now (regardless of how tools were assembled) so a finalize that names no file
+            // can still fall back to the document(s) this leg produced.
+            if (ThreadFilesDir(session) is { } snapDir && Directory.Exists(snapDir))
+                foreach (var f in new DirectoryInfo(snapDir).GetFiles()) filesAtLegStart[f.Name] = f.LastWriteTimeUtc;
+
+            // Drawing states think less — see Think below.
+            var drafting = task.BuildsWidget is { Length: > 0 }
+                           && (task.AdjustsWidget || PanelBuild.Drafts(task.PanelStep));
+
+            var input = new AgentInput
+            {
+                // WHERE AND WHEN. This used to go only to the orchestrator, so the half of the system that
+                // actually does things — books the taxi, finds the restaurant, checks what's open — was the half
+                // that didn't know what day it was or where the user was standing. The chat voice would resolve
+                // "near me" perfectly and then delegate a task that had no idea. Day granularity, so the shared
+                // prefix still caches for the whole day.
+                SystemPrompt = _workerSystem() + HereAndNow() + ProjectContext(task.Project, task.Room) + PersonaContext(task),
+                Model = ModelRouting.Spec(_model, _ollamaBaseUrl),
+                // Seed with the task's running transcript so a resumed worker keeps everything it found and
+                // the Q&A so far. AnswerStream appends to this list, so afterwards it IS the full transcript.
+                Conversation = task.Conversation,
+                Tools = tools,
+                DrainInbox = () => DrainInbox(task),
+                // Honesty over speed: with reasoning on, the worker inspects tool output, notices junk
+                // (e.g. a blank free-space field) and either recovers or says it couldn't — instead of
+                // fabricating. Reliability past that is a model problem, fixed by a better model, not by
+                // bolting model-specific crutches into this (deliberately model-agnostic) system.
+                //
+                // Except where there is nothing to be honest ABOUT. A state that invents its own values and
+                // writes a component has called no source and read no response; the scepticism has no subject,
+                // and all it does there is spend two minutes before the panel appears. See PanelBuild.Drafts.
+                Think = !drafting,
+                // Tell the worker how many turns remain as it nears the cap, so it saves its deliverable before
+                // running out — the failure where a step made charts and stopped one turn before writing its file.
+                AnnounceBudget = true,
+                // Real work costs more turns than the library default (8) assumes: one site is a navigate, a read,
+                // often a scroll and an inspect, so eight turns is roughly two pages — and a research task that
+                // has to compare several places ran out mid-job and reported what it had. The supervisor decides
+                // when a run has actually stalled; this is just enough room to reach that judgement honestly.
+                MaxIterations = 40,
+                // Five calls to one tool is a loop for a tool that answers a question, and a normal morning for one
+                // whose whole job is to be called again with different arguments: a run that visited three wrong
+                // addresses, went back to a search and found the right one was cut off by this on the call that
+                // would have worked. Repetition is still caught — by identical arguments, which is what a loop
+                // actually looks like — so this only has to be generous enough not to punish breadth.
+                MaxCallsPerTool = 20,
+            };
+            if (task.Persona is "data_scientist" or "branding_designer")
+            {
+                // run_python IS these personas' workhorse — it iterates: the data_scientist profiles data, computes
+                // stats and renders charts; the branding_designer assembles a multi-element designed document
+                // (reportlab/HTML, embedding logo + charts). The default per-tool budget (5) chokes that mid-build
+                // and the watchdog then forces a half-finished fallback. Give run_python real headroom and tolerate
+                // the odd failed call (e.g. a missing optional import) without aborting the deliverable.
+                input.MaxCallsPerTool = 25;
+                input.MaxToolFailures = 8;
+            }
+            var worker = new SmartyAgent(input);
+            var thought = new StringBuilder();
+            var lastThoughtSent = DateTimeOffset.MinValue; // throttles the "thinking" hints sent to the UI
+
+            // One drive of the worker with a given message: stream its events, supervised by the watchdog, and
+            // log the transcript. Called once normally, then re-invoked by the builder-completion guard below.
+            // The volatile bits, attached to the message being sent rather than to the transcript's head: the
+            // model sees them just as clearly, and the cacheable prefix in front of them never moves.
+            string WithNow(string msg)
+            {
+                var now = DateTime.Now;
+                return $"[It is {now:dddd, d MMMM yyyy, HH:mm} ({TimeZoneInfo.Local.StandardName}), year {now.Year} " +
+                       "— the real present from the system clock, not the future.]\n\n" + msg;
+            }
+
+            async Task RunPassAsync(string msg)
+            {
+                msg = WithNow(msg);
+                // Supervise this pass: a background watchdog watches the live transcript and nudges the worker to
+                // wrap up (or aborts it) if it starts thrashing. Stopped the instant the pass ends.
+                using var monitorCts = CancellationTokenSource.CreateLinkedTokenSource(task.Cts.Token);
+                if (_watchdog is not null)
+                    _ = _watchdog.MonitorAsync(task, monitorCts.Token, Trace);
+                try
+                {
+                    await foreach (var ev in worker.AnswerStream(msg, task.Cts.Token).ConfigureAwait(false))
+                    {
+                        switch (ev)
+                        {
+                            case AgentEvent.ReasoningDelta r:
+                                thought.Append(r.Text);
+                                task.LatestThought = Tail(thought, 240);
+                                // Surface it, throttled: between tool calls a worker can reason for many seconds
+                                // and the UI would otherwise show a spinner with nothing under it, which reads as
+                                // "stopped". Throttled because deltas arrive per-token and this is a UI hint, not
+                                // a transcript.
+                                if (DateTimeOffset.UtcNow - lastThoughtSent > TimeSpan.FromSeconds(2))
+                                {
+                                    lastThoughtSent = DateTimeOffset.UtcNow;
+                                    session.Append("thinking", Json(new
+                                    {
+                                        id = task.Id,
+                                        msgId = task.OriginMessageId,
+                                        text = Head(task.LatestThought ?? "", 140),
+                                    }));
+                                }
+                                break;
+                            case AgentEvent.ContentDelta c:
+                                thought.Append(c.Text);
+                                task.LatestThought = Tail(thought, 240);
+                                break;
+                            case AgentEvent.ToolStarted ts:
+                                task.LatestThought = $"running {ts.ToolName}…";
+                                Trace($"[tool] start {ts.ToolName} {Snip(ts.Arguments, 160)}");
+                                // Surface the worker's tool call on the session stream so observers (the control
+                                // centre) can render live tool-calling visuals. The chat/Slack surfaces ignore it.
+                                session.Append("tool_started", Json(new { id = task.Id, name = ts.ToolName, arguments = ts.Arguments }));
+                                break;
+                            case AgentEvent.ToolCompleted tc:
+                                Trace($"[tool] done  {tc.ToolName} -> {Snip(tc.Result, 300)}");
+                                session.Append("tool_completed", Json(new { id = task.Id, name = tc.ToolName, result = Snip(tc.Result, 4000) }));
+                                break;
+                            case AgentEvent.Completed done:
+                                result = done.Answer;
+                                break;
+                        }
+                    }
+                }
+                finally
+                {
+                    monitorCts.Cancel(); // stop supervising the moment this pass ends
+                }
+
+                // Roll this leg's model spend onto the task before anything else — a leg that then fails still
+                // cost money, and a cost report that only counts successes is a lie.
+                if (worker.LastRun is { } spent) task.Spend.Add(spent.Spend);
+
+                // Capture the worker transcript (task → tool calls → results → answer) for the dataset.
+                if (worker.LastRun is { } run)
+                    _log.Interaction(new
+                    {
+                        ts = DateTimeOffset.UtcNow,
+                        session = session.Id,
+                        task_id = task.Id,
+                        role = "worker",
+                        model = _model,
+                        think = true,
+                        system = input.SystemPrompt,
+                        tools = ToolSchemas(input.Tools),
+                        task = task.Description,
+                        transcript = ProjectMessages(run.Messages),
+                        result,
+                    });
+            }
+
+            // The opening brief rides the first drive message and is then spent: it is per-task and volatile, so
+            // at the head of the transcript it would push every task onto its own cache prefix, and repeated on
+            // a later leg it would re-introduce a guide the worker has already found to be wrong about the site.
+            if (task.OpeningNote is { Length: > 0 } opening)
+            {
+                message = opening + "\n\n" + message;
+                task.OpeningNote = null;
+                // Traced because the previous version of this note was assembled, stored and then read by
+                // nobody: it was set on the task and never attached to anything, so a worker that was supposed
+                // to know where its workspace was simply didn't, and nothing said so.
+                Trace($"[worker #{task.Id}] opening brief attached ({opening.Length} chars)");
+            }
+            await RunPassAsync(message);
+        }
+        catch (OperationCanceledException)
+        {
+            cancelled = true;
+        }
+        catch (Exception ex)
+        {
+            task.Status = "failed";
+            result = $"(the task could not be completed: {ex.Message})";
+        }
+
+        if (task.Status == "cancelled") cancelled = true;
+
+        // Did the worker pause to ask the user something rather than finish? We don't guess this from its
+        // prose — we FORCE a structured verdict: a schema-constrained finalization call (below) returns a
+        // real question object or nothing. Only run it when the worker finished cleanly (not cancelled/
+        // failed). If it asked, park the task as "waiting": its transcript is already on task.Conversation,
+        // the question is surfaced to the user, and we neither log a run nor re-voice — the run is paused.
+        // A plan's child STEP never pauses to ask the user — the coordinator decides pass/retry/pause for it —
+        // so the question-finalize is top-level only.
+        var outcome = (!cancelled && task.Status == "running" && task.ParentTaskId is null)
+            ? await FinalizeOutcomeAsync(session, task, task.Cts.Token).ConfigureAwait(false)
+            : null;
+        var question = outcome?.Question;
+        if (question is not null)
+        {
+            PauseWithQuestion(session, task, question);
+            return;
+        }
+
+        // Any photo the worker found gets mirrored before the result goes anywhere: the relay is told to copy an
+        // image through verbatim, so whatever URL is in here is the one that has to work in the browser.
+        if (Links is not null)
+            result = await Links.MirrorImagesAsync(result, CancellationToken.None).ConfigureAwait(false);
+
+        task.Result = result;
+        if (task.Status == "running") task.Status = "done";
+
+        // A child step's lifecycle is internal — only the coordinator's own working/working_done are surfaced,
+        // so the user sees one task progressing, not a flurry of sub-tasks.
+        // Spend is a top-level concern — a plan reports once, not per step. The lifecycle event is NOT: "working"
+        // is emitted for every task including a plan's steps, so suppressing its counterpart here left a pill
+        // spinning with nothing able to finish it, which survived a refresh because the replay found a start and
+        // no end. Whatever raises a pill has to be able to put it down.
+        if (task.ParentTaskId is null) EmitSpend(session, task);
+        session.Append("working_done", Json(new { id = task.Id, status = task.Status, msgId = task.OriginMessageId, at = DateTimeOffset.UtcNow }));
+        Trace($"[worker #{task.Id}] RESULT >>> {Snip(result, 500)}");
+
+        // Record what the sub-agent did, scoped to its project (work with no project isn't logged here —
+        // it isn't shown anywhere). The full accumulated transcript (across any Q&A legs) is on
+        // task.Conversation. Read back by the project overview.
+        if (!string.IsNullOrEmpty(task.Project) && task.Conversation.Count > 0)
+        {
+            var transcript = task.Conversation;
+            var run = new ProjectRun
+            {
+                Id = Guid.NewGuid().ToString("N")[..8],
+                Project = task.Project!,
+                Task = task.Description,
+                Status = task.Status,
+                StartedAt = task.StartedAt,
+                EndedAt = DateTimeOffset.UtcNow,
+                Steps = BuildSteps(transcript),
+                Result = result,
+                // So the project can point at what this run produced, not just describe it.
+                Session = session.Id,
+                Files = (outcome?.Show ?? Array.Empty<string>()).ToList(),
+            };
+            _runs.Add(run);
+            // Refresh the project's summary + give the run a short label, both in the background.
+            _ = RegenerateSummaryAsync(task.Project!);
+            _ = GenerateRunTitleAsync(run.Id, task.Description, result);
+        }
+
+        // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
+        // Re-checked LIVE (not just the latched flag): a cancel can land during the finalize/result window
+        // above, and we must not speak a result the user already told us to drop.
+        // ---- things that must happen however the task ended, INCLUDING cancelled ----
+        //
+        // Below the return that follows, "however it ended" quietly meant "if it ended well". Both of these were
+        // down there, and both are cleanup: the browser the user is still using, and the panel on the home page
+        // claiming a worker is on it. A cancel is not a reason to skip cleaning up — it is the most likely reason
+        // cleanup is needed. The camera build timed out after five minutes, the timeout surfaced as a cancellation,
+        // and the panel showed "Fixing…" for the next forty minutes with nothing alive behind it.
+
+        // The tabs go. A finished task has no business leaving anything behind in a browser someone else is using.
+        if (task.UsedBrowser) await TidyBrowserAsync().ConfigureAwait(false);
+
+        // A panel being built has a place on the page saying so. If the build ended without publishing, that place
+        // has to stop claiming a worker is on it.
+        //
+        // The COORDINATOR only. One state of a build ending is not the build ending — every state carries the panel
+        // id so it can be handed the panel's tools, and without this the first state to finish would find the panel
+        // still "building", conclude the build had ended without publishing, and kill it before the second state ran.
+        if (task.BuildsWidget is { Length: > 0 } unfinished && task.ParentTaskId is null && _widgets is not null)
+        {
+            var building = _widgets.Get(unfinished);
+            if (building is not null && building.Status == WidgetStatus.Building)
+            {
+                _widgets.Failed(unfinished, cancelled || task.Status == "cancelled"
+                    ? "The build stopped before it published anything — it was cancelled or it timed out."
+                    : Head(result is { Length: > 0 } why ? why : "The build finished without publishing a panel.", 200));
+                Trace($"[widget] {unfinished} build ended without publishing ({task.Status}" +
+                      (cancelled ? ", cancelled" : "") + ")");
+            }
+        }
+
+        // A cancellation was already acknowledged to the user when they asked to stop — don't re-voice.
+        if (cancelled || task.Cts.IsCancellationRequested || task.Status == "cancelled") return;
+
+        // Deliverables: hand the user the file(s) the finalize marked to show, and persist anything it marked to
+        // keep — driven by the structured verdict, the SOLE delivery path now that send_file is gone. Done here,
+        // after the cancel re-check, so a stopped task uploads nothing. savedNote tells the re-voice what was saved.
+        // What this changes about what we know, worked out in the background. The user is waiting on the answer,
+        // Nothing is filed off the back of a run any more.
+        //
+        // There used to be a model call here asking every finished run what was now known, and it answered honestly and
+        // usefully from its own point of view: the Instagram handle of a restaurant it had opened, a menu page's status
+        // code, the fact that it had published a panel. All true, none of it anybody's world, and no amount of asking it
+        // not to changed that — a worker cannot judge what is worth remembering because it does not know what its owner
+        // cares about. The orchestrator relays this result in the next turn with the conversation in front of it, and
+        // files what matters from there. One door, and it is the one with the context.
+
+        // And what it learned about HOW, which is a different question from what it learned. Same moment,
+        // because a finished run is the only point that can see the whole path it took; same background, because
+        // the user is waiting on the answer and neither of these is part of answering.
+        if (task.Status == "done" && task.Conversation.Count > 0)
+            _ = LearnHowAsync(task, BuildSteps(task.Conversation));
+
+        // A PROACT RUN MUST NOT BE ABLE TO LOSE ITS OWN WORK.
+        //
+        // Its brief ends with "record what you did" and its three tools are the only way anything reaches the
+        // timeline. The first live run ignored all three: it went out, found a specific place, wrote a careful
+        // summary of what it had and had not verified — and returned it as prose to a conversation nobody was
+        // reading. The work happened and vanished, which is the same shape of failure as a worker writing prose
+        // claiming it had filed something.
+        //
+        // Nobody is waiting on a Proact run, so there is no next turn to relay it: this is the only moment that can
+        // catch it. Filed as `looked` rather than guessed at, because what it found is the model's to characterise
+        // and it declined to — but the text is kept, so the finding survives and the timeline stays honest about
+        // where it came from.
+        // Back from the trip, whatever it came home with, so the next tick is free to go out again.
+        if (task.Proact is { Length: > 0 } && _proact is not null && task.ParentTaskId is null)
+            _proact.Working(null);
+
+        // And how the one commit went. A ticked proposal runs here as an ordinary task, so nothing above this line
+        // knows it began life as an offer; the conversation's own name is the only thread back to it.
+        if (_proact is not null && task.ParentTaskId is null && Proact.TickedIn(session.Id) is { } committed)
+            _proact.Finished(committed, task.Status);
+
+        if (task.Proact is { Length: > 0 } filedUnder && _proact is not null && task.Status == "done")
+        {
+            var since = task.StartedAt;
+            if (!_proact.Since(since).Any() && Snip(task.Result, 400) is { Length: > 20 } said)
+            {
+                _proact.Add(new ProactAction
+                {
+                    Kind = ProactKinds.Looked, Mode = filedUnder,
+                    What = said,
+                    Why = "It went and looked, and finished without filing anything — this is what it came back with.",
+                });
+                Trace($"[proact] worker #{task.Id} filed nothing; kept its answer so the work isn't lost");
+            }
+        }
+
+        // A published panel is looked at before it is believed. Nothing else in the system can tell a working camera
+        // from a broken-image icon, because neither of the other checks is looking at the screen.
+        //
+        // Only once it has actually SHOWN something, though. Publishing is not loading: a panel whose source is the
+        // user's own logged-in browser can take minutes to fill, and photographing it in between caught its loading
+        // state and had a correct panel rebuilt. If there is nothing yet, the store raises it on first sight instead.
+        // Again the coordinator only, and for a build that runs as states not even that: its last state IS the look,
+        // and it waits for the first load rather than racing it. Two lookers would photograph the same panel twice
+        // and file two opinions about it.
+        if (task.BuildsWidget is { Length: > 0 } finished && task.ParentTaskId is null && !task.PanelStates
+            && _widgets?.Get(finished) is { } published
+            && published.Status == WidgetStatus.Live && _lookAtWidget is not null
+            && published.Data is { Length: > 0 })
+            _ = _lookAtWidget(published);
+
+        // A run that followed a guide and failed is the only evidence there is that the guide has gone wrong,
+        // and until now it was thrown away: the write-up runs on success only, so a guide that walked three runs
+        // into a wall was handed out a fourth time unchanged. A cancel is not counted — that is the user stopping
+        // the work, not the site disagreeing with the guide.
+        if (task.Guides.Count > 0 && _hints is not null)
+        {
+            if (task.Status == "done") _hints.Held(task.Guides);
+            else if (task.Status == "failed")
+            {
+                var dropped = _hints.Missed(task.Guides);
+                Trace($"[guides] task {task.Id} failed following {string.Join(", ", task.Guides)}" +
+                      (dropped.Count > 0 ? $" — dropped: {string.Join(", ", dropped)}" : " — one miss each"));
+            }
+        }
+
+        string? savedNote = null;
+        if (outcome is not null && task.ParentTaskId is null)
+        {
+            // Fallback: if finalize named nothing to show, deliver the document(s) this leg actually produced, so
+            // a finalize miss never means the user gets nothing (the failure that made delivery feel unreliable).
+            if (outcome.Show.Count == 0 && FallbackDeliverables(session, filesAtLegStart) is { Count: > 0 } fb)
+            {
+                Trace($"[worker #{task.Id}] deliver fallback -> {string.Join(",", fb)}");
+                outcome = outcome with { Show = fb };
+            }
+            savedNote = ApplyDeliverables(session, task, outcome, sentFiles);
+            // After the fallback has run, so a deliverable finalize forgot to name is kept too.
+            KeepForProject(session, task, outcome.Show);
+        }
+
+        // A plan's child STEP doesn't speak to the user — its coordinator relays the whole plan once at the
+        // end. Only a top-level task re-voices its own result here.
+        if (task.ParentTaskId is null)
+            await ReVoiceAsync(session, task, result, savedNote).ConfigureAwait(false);
+    }
+
+    /// <summary>Relay a finished task's result to the user in the orchestrator's voice. The MODEL phrases it
+    /// (so it matches the user's language), but on a strict instruction: a blank/"(no result)" result must be
+    /// reported as a failure with nothing invented — the re-voice once fabricated a whole "latest news" rundown
+    /// from an empty result. Shared by single workers and the plan coordinator.</summary>
+    private async Task ReVoiceAsync(Session session, TaskInfo task, string result, string? savedNote = null)
+    {
+        bool failed = string.IsNullOrWhiteSpace(result)
+            || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase);
+
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            var instruction = failed
+                ? $"A background task you tried could not be completed (it returned no result).\nTask: {task.Description}\n\n" +
+                  "Tell the user — in the SAME language they have been speaking — that you weren't able to get " +
+                  "this just now, and offer to try again. Do NOT invent, pad, guess, or fill in any answer from " +
+                  "your own knowledge. Don't mention tasks, workers, delegation, or any internal mechanics."
+                : $"A background task you delegated has finished.\nTask: {task.Description}\nResult:\n{result}\n\n" +
+                  "Relay this to the user now in a natural, friendly, concise way — as if you just finished " +
+                  "checking for them. Do not mention tasks, workers, delegation, or any internal mechanics; " +
+                  "just give them the answer conversationally.\n" +
+                  "CRITICAL: this result came from live tools with real, current data — you do NOT. Relay its " +
+                  "findings faithfully. Do NOT contradict, second-guess, water down, or 'correct' them using " +
+                  "your own memory or assumptions about what year it is. If the result says something is " +
+                  "happening now, it is happening now. But if it says it couldn't find/get something, tell the " +
+                  "user that plainly — never invent or pad it.\n" +
+                  "Copy any ![image](url) through exactly as written — that is how the user sees it.";
+
+            // The file(s) themselves are already uploaded; this just lets the orchestrator mention, in passing,
+            // anything that was saved for next time (e.g. a new brand kit) so the user isn't left guessing.
+            if (!failed && !string.IsNullOrEmpty(savedNote)) instruction += savedNote;
+
+            // File-claim honesty (default-DENY): only ever say a file was sent if one ACTUALLY went out — tracked
+            // at the real upload points (send_file + the deliver pass), not inferred from the result text, which
+            // frequently claims "I've attached it" when nothing was delivered. With nothing delivered, forbid the
+            // claim outright rather than relay the worker's phantom send.
+            if (!failed)
+                instruction += task.DeliveredFiles.Count > 0
+                    ? $"\n\nA file WAS delivered to the user this turn: {string.Join(", ", task.DeliveredFiles)}. " +
+                      "You may refer to it as sent/attached."
+                    : "\n\nIMPORTANT: NO file was delivered to the user this turn. Do NOT say you've sent, attached, " +
+                      "shared, or produced a file — even if the result text claims one. If a file was the point, say " +
+                      "it isn't ready and offer to produce it.";
+
+            var convo = new List<Message>(session.History) { Message.System(instruction) };
+
+            Trace($"[worker #{task.Id}] re-voice start{(failed ? " (failed task — honest, no invent)" : "")}");
+
+            // The re-voice SAYS what happened; it must not start more of it.
+            //
+            // Armed with the full toolset it did exactly that: a worker handed back a partial result ("I've hit my
+            // tool budget, here's where things stand"), and the re-voice — reading an unfinished job — helpfully
+            // called message_task to carry on. The task had already been marked done, so the user watched it
+            // finish and immediately restart; worse, the resumed worker picked up from its own opening premise
+            // (log into Ocado) which the user had ruled out two answers earlier. A speaking turn that can act will
+            // eventually act on a stale plan.
+            //
+            // Everything else stays: it can still look things up in order to relay the result accurately. If more
+            // work is genuinely wanted, the next user turn asks for it — with the current premise, not last
+            // hour's.
+            var tools = (session.PinnedProject is null ? _orchestratorTools : _pinnedTools)
+                .Where(t => t.Name is not ("delegate" or "message_task"))
+                .ToArray();
+            // If the re-voice turn says nothing out loud, relay the worker's own words rather than apologising —
+            // the work is done and the answer exists. Only for a task that actually succeeded: relaying the raw
+            // text of a FAILED run would parrot an error at the user as though it were an answer.
+            string content = await RunOrchestratorTurnAsync(
+                session, convo, tools, think: _revoiceThink, CancellationToken.None,
+                silentFallback: failed ? null : result).ConfigureAwait(false);
+            Trace($"[worker #{task.Id}] re-voice done (user now sees the answer)");
+
+            session.History.Add(Message.Assistant(string.IsNullOrWhiteSpace(content) ? result : content));
+
+            // The answer has been said, so its message is the one that names the file — put the card under it.
+            FlushUnannouncedFiles(session, task, session.CurrentMessageId);
+        }
+        finally
+        {
+            // Whatever happened above, a delivered file must reach the user. If the re-voice never ran (it threw,
+            // or the task went another way) these are still pending, so send them against the task's own message
+            // rather than silently keeping a file nobody can see.
+            FlushUnannouncedFiles(session, task, task.OriginMessageId);
+            session.TurnLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Whether a deliverable is a picture rather than a document.
+    /// </summary>
+    /// <remarks>
+    /// By extension, which is all there is to go on and is enough: the question is only ever asked about files a job
+    /// wrote into its own workspace, and one ending .jpg is a photograph in every case that has come up.
+    /// </remarks>
+    private static bool IsPicture(string name) =>
+        Path.GetExtension(name).ToLowerInvariant() is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".avif";
+
+    /// <summary>Emit the cards for files delivered this turn, against the message that talks about them.</summary>
+    private void FlushUnannouncedFiles(Session session, TaskInfo task, int msgId)
+    {
+        var root = RootTask(session, task);
+        if (root.UnannouncedFiles.Count == 0) return;
+
+        foreach (var (path, name) in root.UnannouncedFiles)
+            session.Append("file", Json(new { path, name, caption = (string?)null, msgId }));
+
+        root.UnannouncedFiles.Clear();
+    }
+
+    /// <summary>Run a multi-discipline plan to completion: each step is a hidden child worker of <paramref
+    /// name="parent"/>, run in order over the shared thread file area, with each step's output threaded into the
+    /// next step's brief. On a step that can't deliver (after one retry) the plan PAUSES at that step and the
+    /// coordinator relays honestly what it has — the partial artifacts and transcripts are all preserved, so a
+    /// follow-up resumes from there. When <paramref name="refineForCurrent"/> is set, the step at
+    /// <see cref="WorkPlan.CurrentStep"/> resumes its existing child with that note (a user refinement) instead
+    /// of starting fresh; later steps re-run to cascade the change forward.</summary>
+    private async Task DrivePlanAsync(Session session, TaskInfo parent, WorkPlan plan, string? refineForCurrent)
+    {
+        var prior = new System.Text.StringBuilder();
+        int resumeAt = plan.CurrentStep; // the step the refine (if any) targets — captured before we advance
+        // Re-establish context from steps already done before the resume point (so a resume threads them forward).
+        for (int j = 0; j < resumeAt && j < plan.Steps.Count; j++)
+            if (plan.Steps[j].Result is { Length: > 0 } r)
+                prior.Append($"\n### Output of step {j + 1} ({plan.Steps[j].Persona}):\n{r}\n");
+
+        // Steps still to run (resume point onward), grouped into WAVES: steps sharing a wave are independent and
+        // run concurrently; ascending waves run in turn, each seeing every earlier wave's output. The common case
+        // (one step per wave) is exactly the old sequential behaviour.
+        var waves = Enumerable.Range(resumeAt, plan.Steps.Count - resumeAt)
+            .Select(i => (Step: plan.Steps[i], Index: i))
+            .GroupBy(x => x.Step.Wave)
+            .OrderBy(g => g.Key)
+            .ToList();
+
+        foreach (var wave in waves)
+        {
+            if (parent.Cts.IsCancellationRequested) { parent.Status = "cancelled"; return; }
+            var members = wave.OrderBy(m => m.Index).ToList();
+            plan.CurrentStep = members[0].Index;
+            parent.Status = "running";
+            foreach (var m in members) m.Step.Status = "running";
+
+            string label = members.Count == 1
+                ? $"step {members[0].Index + 1}/{plan.Steps.Count} ({members[0].Step.Persona}): {Head(members[0].Step.Instruction, 70)}"
+                : $"{members.Count} steps in parallel — {string.Join(", ", members.Select(m => m.Step.Persona))}";
+            parent.LatestThought = label;
+            session.Append("working", Json(new { id = parent.Id, task = label, msgId = parent.OriginMessageId, at = DateTimeOffset.UtcNow }));
+            Trace($"[plan #{parent.Id}] wave {wave.Key}: {string.Join(", ", members.Select(m => $"#{m.Index + 1}[{m.Step.Persona}]"))}");
+
+            // Run the whole wave concurrently over one frozen prior-context snapshot. The refine note (if any)
+            // only goes to the step the user's change actually targets; the rest just (re)run normally.
+            string priorSnapshot = prior.ToString();
+            async Task<(int Index, PlanStep Step, bool Ok, string Reason)> RunMember((PlanStep Step, int Index) m)
+            {
+                var (ok, reason) = await RunPlanStepAsync(
+                    session, parent, m.Step, priorSnapshot, m.Index == resumeAt ? refineForCurrent : null).ConfigureAwait(false);
+                return (m.Index, m.Step, ok, reason);
+            }
+            var runs = await Task.WhenAll(members.Select(RunMember)).ConfigureAwait(false);
+
+            // Cancelled anywhere in the wave → stop silently (the stop was already acknowledged to the user).
+            if (parent.Cts.IsCancellationRequested || runs.Any(r => r.Reason == "cancelled"))
+            { parent.Status = "cancelled"; return; }
+
+            // Thread every success into the prior context (index order) so the next wave — and any resume — sees
+            // them, even if a sibling in this wave failed.
+            foreach (var r in runs.Where(r => r.Ok).OrderBy(r => r.Index))
+            {
+                r.Step.Status = "done";
+                prior.Append($"\n### Output of step {r.Index + 1} ({r.Step.Persona}):\n{r.Step.Result}\n");
+            }
+
+            // A genuine failure pauses the plan at the earliest failed step; the wave's other work is preserved.
+            if (runs.Where(r => !r.Ok).OrderBy(r => r.Index).ToList() is { Count: > 0 } failed)
+            {
+                var f = failed[0];
+                f.Step.Status = "failed";
+                parent.Status = "waiting"; // paused, not dead: resumable from here
+                parent.LatestThought = $"stuck on step {f.Index + 1}: {Head(f.Reason, 80)}";
+                session.Append("working_done", Json(new { id = parent.Id, status = "waiting", at = DateTimeOffset.UtcNow }));
+                var doneLabels = plan.Steps.Where(s => s.Status == "done").Select(s => s.Persona).ToList();
+                var summary =
+                    $"The plan completed {(doneLabels.Count == 0 ? "no steps" : string.Join(", ", doneLabels))}, " +
+                    $"then stalled on step {f.Index + 1} ({f.Step.Persona}): {f.Step.Instruction}. " +
+                    $"What blocked it: {f.Reason}. The work so far is saved.";
+                parent.Result = summary;
+                Trace($"[plan #{parent.Id}] PAUSED at step {f.Index + 1}: {Snip(f.Reason, 160)}");
+                await ReVoiceAsync(session, parent, summary).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        plan.CurrentStep = plan.Steps.Count;
+        // A cancel that landed during the FINAL step would otherwise fall through here and re-voice the result
+        // (the per-step boundary check is only hit on the next iteration, which never comes). Catch it.
+        if (parent.Cts.IsCancellationRequested) { parent.Status = "cancelled"; return; }
+        parent.Status = "done";
+        var last = plan.Steps[^1];
+        parent.Result = string.IsNullOrWhiteSpace(last.Result) ? "(no result)" : last.Result;
+        session.Append("working_done", Json(new { id = parent.Id, status = "done", at = DateTimeOffset.UtcNow }));
+        Trace($"[plan #{parent.Id}] DONE ({plan.Steps.Count} steps)");
+
+        // DELIVER the plan's output the SAME structured way a single worker does — this used to run nowhere for a
+        // plan (finalize/deliver are gated to top-level non-plan tasks, and the coordinator runs through here, not
+        // DriveWorker), which is why plan steps had to fall back to calling send_file by hand. Build a synthetic
+        // transcript from the steps' results so the finalize can pick the user-facing deliverable(s) out of the
+        // shared files area, then hand them over. De-dupe against anything a step already delivered mid-run.
+        string? savedNote = null;
+        if (!parent.Cts.IsCancellationRequested)
+        {
+            var planConvo = new List<Message> { Message.User(parent.Description) };
+            foreach (var s in plan.Steps)
+                if (!string.IsNullOrWhiteSpace(s.Result))
+                    planConvo.Add(Message.Assistant($"[{s.Persona}] {s.Result}"));
+            var planOutcome = await FinalizeOutcomeAsync(session, parent, parent.Cts.Token, planConvo).ConfigureAwait(false);
+
+            // Fallback: if finalize named nothing and no step delivered anything either, hand over the document(s)
+            // the plan produced — so the user never ends up with nothing after a full plan.
+            if (planOutcome.Show.Count == 0 && parent.DeliveredFiles.Count == 0
+                && FallbackDeliverables(session, null) is { Count: > 0 } pfb)
+            {
+                Trace($"[plan #{parent.Id}] deliver fallback -> {string.Join(",", pfb)}");
+                planOutcome = planOutcome with { Show = pfb };
+            }
+
+            var already = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ThreadFilesDir(session) is { } fd)
+                foreach (var n in parent.DeliveredFiles) already.Add(Path.GetFullPath(Path.Combine(fd, n)));
+            savedNote = ApplyDeliverables(session, parent, planOutcome, already);
+
+            // Shelve with the project, which a plan never did. DriveWorker does this for a single worker, inside
+            // a block gated on being top-level — and a plan's coordinator runs through here instead, so a
+            // project whose work happened to be planned rather than done in one go collected no files at all.
+            // A profile PDF was produced, delivered to the chat, and simply never appeared in its project.
+            // Both halves are shelved: what the finalize named, and what the steps already handed over
+            // themselves, since either can be the thing the user is looking for later.
+            KeepForProject(session, parent, planOutcome.Show.Concat(parent.DeliveredFiles)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList());
+        }
+
+        await ReVoiceAsync(session, parent, parent.Result!, savedNote).ConfigureAwait(false);
+    }
+
+    /// <summary>Run one plan step as a hidden child worker, with one retry on a verified failure. Returns
+    /// (true, "") once the step's output satisfies what it was meant to produce, or (false, reason) when it
+    /// still can't after the retry — at which point the coordinator pauses the plan. Records the child id on the
+    /// step so a later refine can resume it. Reuses an existing child (resume) when one is already attached.</summary>
+    private async Task<(bool Ok, string Reason)> RunPlanStepAsync(
+        Session session, TaskInfo parent, PlanStep step, string priorContext, string? note)
+    {
+        string lastReason = "the step produced no usable result";
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (parent.Cts.IsCancellationRequested) return (false, "cancelled");
+
+            // Resume an existing child (a refine, or this step ran before) so it ADJUSTS rather than redoes;
+            // otherwise spin up a fresh child for this step. Either way it shares the thread file area, so it
+            // sees what earlier steps produced.
+            TaskInfo child;
+            string message;
+            if (step.ChildTaskId is { } cid && session.Tasks.TryGetValue(cid, out var existing) && existing.Conversation.Count > 0)
+            {
+                child = existing;
+                child.Status = "running";
+                child.Plan = null;
+                message = note is { Length: > 0 }
+                    ? note
+                    : "An earlier step in the plan was revised. Refresh your output to match the updated files " +
+                      "in this conversation's files area, keeping everything else as-is.";
+                if (attempt > 0) message += $"\n\n(Your previous attempt didn't satisfy the step: {lastReason}. Try again.)";
+            }
+            else
+            {
+                child = new TaskInfo
+                {
+                    Id = session.NextTaskId(),
+                    Description = step.Instruction,
+                    Persona = step.Persona,
+                    ParentTaskId = parent.Id,
+                    // A step of a project's plan is work on that project. Without this it inherited no project
+                    // at all, so it got none of the project's tools — the same silent failure as a worker with
+                    // no way to record a fact, writing prose claiming it had.
+                    Project = parent.Project,
+                    UserScope = parent.UserScope,
+                    Room = parent.Room,
+                    UserName = parent.UserName,
+                    // Inherited, because a child of an unattended run is still unattended. Proact tasks are not
+                    // supposed to reach here at all — they are stopped from planning — and this is the second
+                    // guard: a boundary that depends on one check is a boundary that ends one refactor from now.
+                    Proact = parent.Proact,
+                };
+                child.WorkspaceDir = CreateWorkspace(session, child, null);
+                session.Tasks[child.Id] = child;
+                step.ChildTaskId = child.Id;
+                var sb = new System.Text.StringBuilder(step.Instruction);
+                sb.Append("\n\nThis is one step of a larger plan. Expected output: ").Append(step.Produces).Append('.');
+                if (priorContext.Length > 0)
+                    sb.Append("\n\nWhat earlier steps produced (their files are in this conversation's files area):\n")
+                      .Append(priorContext);
+                if (attempt > 0)
+                    sb.Append($"\n\n(Your previous attempt didn't satisfy the step: {lastReason}. Try again.)");
+                message = sb.ToString();
+            }
+
+            await DriveWorker(session, child, message).ConfigureAwait(false);
+            if (child.Status == "cancelled") return (false, "cancelled");
+
+            var result = child.Result ?? "";
+            // Hand the verifier the files this step actually left behind, so a deliverable saved as a file passes
+            // even when the text result is terse — and a step that only TALKED about producing one is caught.
+            var present = new List<string>();
+            if (ThreadFilesDir(session) is { } sfd && Directory.Exists(sfd))
+                foreach (var fi in new DirectoryInfo(sfd).GetFiles()) present.Add(fi.Name);
+            var (verdictOk, verdictReason) = await _planner!.VerifyStepAsync(
+                step.Instruction, step.Produces, result, parent.Cts.Token, present).ConfigureAwait(false);
+            if (verdictOk)
+            {
+                step.Result = result;
+                return (true, "");
+            }
+            lastReason = string.IsNullOrWhiteSpace(verdictReason) ? "the output didn't meet the step's goal" : verdictReason;
+            Trace($"[plan #{parent.Id}] step retry — {Snip(lastReason, 140)}");
+        }
+        return (false, lastReason);
+    }
+
+    /// <summary>Re-enter a finished/paused plan with a user refinement: route it to the step it touches (or
+    /// append a new step), rewind the plan to there, and resume — the targeted step adjusts and the rest cascade
+    /// forward. Keeps the whole change attached to the one plan task. Fire-and-forget.</summary>
+    private async Task RefinePlanAsync(Session session, TaskInfo parent, string message, bool fromUser = false)
+    {
+        var plan = parent.Plan!;
+        // Same trap as AnswerTaskAsync: message_task reaches here too, and emitting its text as "user" attributed
+        // the orchestrator's own steering to the person it was steering on behalf of.
+        if (fromUser) EmitMessage(session, "user", message);
+        var roster = PersonaRoster();
+        var (idx, newPersona) = await _planner!.RouteRefineAsync(plan, roster, message, parent.Cts.Token).ConfigureAwait(false);
+
+        if (idx < 0)
+        {
+            // A genuinely new discipline — append it as a new step the plan runs next.
+            var persona = newPersona is { Length: > 0 } && _personas?.Get(newPersona) is not null
+                ? newPersona!
+                : plan.Steps[^1].Persona;
+            plan.Steps.Add(new PlanStep(persona, message, "the change the user just asked for"));
+            plan.CurrentStep = plan.Steps.Count - 1;
+            Trace($"[plan #{parent.Id}] refine → new step [{persona}]");
+            await DrivePlanAsync(session, parent, plan, message).ConfigureAwait(false);
+            return;
+        }
+
+        // Rewind to the targeted step; downstream steps re-run to cascade the change.
+        plan.CurrentStep = idx;
+        for (int i = idx; i < plan.Steps.Count; i++) plan.Steps[i].Status = "pending";
+        Trace($"[plan #{parent.Id}] refine → step {idx + 1} ([{plan.Steps[idx].Persona}])");
+        await DrivePlanAsync(session, parent, plan, message).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The OPENING of a string, where <see cref="Snip"/> gives the tail — a result's first words are the ones
+    /// that say what happened ("Added 24 items" / "I don't have a browser"); its last are usually a sign-off.
+    /// Flattened to a single line, so a multi-paragraph result can't break a one-line-per-item list.
+    /// </summary>
+    private static string Head(string s, int max)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var flat = s.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        while (flat.Contains("  ")) flat = flat.Replace("  ", " ");
+        return flat.Length <= max ? flat : flat[..max].TrimEnd() + "…";
+    }
+
+    /// <summary>
+    /// The question, restated, so the answer to it cannot be read as anything else.
+    ///
+    /// <para>
+    /// An answer used to arrive as a bare line of text. The camera build asked for a username and password, got two
+    /// words and a slash back, and called github_list on it as an owner/repo — a fair reading of a string with no
+    /// context around it. The question lived in the CHAT, not in the worker's transcript, and a task rebuilt after a
+    /// restart doesn't contain it at all: the pause is recorded separately from the steps.
+    /// </para>
+    /// </summary>
+    internal static string AnsweredNote(string question) =>
+        $"You stopped and asked the user: \"{question}\"\n" +
+        "The next message is their answer TO THAT QUESTION and nothing else. Read it as the answer — do not read " +
+        "it as a new task, a file path, a repository name, or a command.";
+
+    // Pause a task to ask the user a question (a clarify-before-work gate, or a blocked finalize). Sets it
+    // waiting, surfaces the question on the session stream, and stashes it as Pending so the resume can continue.
+    private void PauseWithQuestion(Session session, TaskInfo task, PendingQuestion question)
+    {
+        task.Status = "waiting";
+        task.Pending = question;
+        task.LatestThought = question.Question;
+        session.Append("working_done", Json(new { id = task.Id, status = "waiting", at = DateTimeOffset.UtcNow }));
+        session.Append("question", Json(new
+        {
+            id = task.Id,
+            question = question.Question,
+            options = question.Options,
+            project = task.Project,
+            kind = question.Kind,
+            number = question.Number,
+            place = question.Place,
+        }));
+        // A build that stops to ask has to ask where the user is, and for a panel that is the panel — not the
+        // conversation it happens to belong to, which they may never open. Recorded on the panel itself so it
+        // survives everything the hub's log does not.
+        if (task.BuildsWidget is { Length: > 0 } asking) _widgets?.Asked(asking, question.Question);
+
+        Trace($"[worker #{task.Id}] WAITING >>> {Snip(question.Question, 200)}");
+    }
+
+    /// <summary>
+    /// What every worker gets: read and author files, reach the web, build a deck, look at a picture.
+    /// <para>
+    /// The baseline for doing a job at all, which is why a persona is given these ON TOP of its own blocks rather
+    /// than instead of them. Specialisation should mean extra tools, never fewer — a routing decision that turns
+    /// out imperfect then costs some expertise instead of costing the ability to act.
+    /// </para>
+    /// <para>
+    /// No shell, deliberately. It was the only tool with no shape and no cost, so it became the answer to
+    /// everything: asked to send an email it grepped the disk for SMTP settings, asked for photos it hand-rolled
+    /// downloads in PowerShell nine times, then base64-encoded an image until the context ran out. Each of those
+    /// is something another tool here does properly. A persona that genuinely needs one declares "shell".
+    /// </para>
+    /// </summary>
+    private List<AgentTool> DefaultWorkerTools(Session session, TaskInfo task, IModelProvider provider)
+    {
+        var tools = new List<AgentTool>
+        {
+            // Windowed, with a hard ceiling per call — the alternative isn't "it reads less", it's that it
+            // reaches for a shell or Python and reads the lot.
+            FileTools.ReadFileTool(rootDir: ThreadFilesDir(session)),
+            // Rooted at the conversation's files, so a file the job was GIVEN can be read by name.
+            FileTools.SummaryTool(provider, _model, rootDir: ThreadFilesDir(session)),
+        };
+        // Pictures, handed straight to the person who asked rather than described to them.
+        //
+        // On the worker rather than the orchestrator because the worker is the half that HAS them: it opened the pages
+        // and saw the images, and by the time its result is re-voiced the urls are gone unless it wrote them down. That
+        // is exactly what went wrong — a job that inspected every photo of a restaurant's food and handed back a
+        // document of adjectives.
+        if (Links is not null)
+            tools.Add(GalleryTool.Create((pictures, ct) =>
+                // Against whatever message is being composed, which while a task runs is the one that announced it —
+                // so the pictures land under "on it" as they are found rather than waiting for the write-up.
+                ShowPicturesAsync(session, task.Project, session.CurrentMessageId, pictures, ct)));
+
+        // The browser is how a worker reaches the web now. Counted in so the tabs it opens can be closed again
+        // when the last task using them is done.
+        var browser = Browser(task);
+        if (browser.Count > 0)
+        {
+            tools.AddRange(browser);
+            Interlocked.Increment(ref _browsing);
+            task.UsedBrowser = true;
+        }
+
+        if (ThreadFilesDir(session) is { } tfd)
+        {
+            Directory.CreateDirectory(tfd);
+            tools.Add(FileTools.WriteFileTool(tfd));
+            tools.Add(FileTools.EditFileTool(tfd));
+            tools.Add(FileTools.FindInFileTool(tfd));
+            tools.Add(FileTools.ListFilesTool(tfd, BucketMounts(task)));
+            // These lived only in the "files" capability, which a default worker never declares — so the worker
+            // that runs most tasks had neither. Then write_file began refusing .html and pointing at
+            // build_presentation, and the result was a worker correctly reporting that it could not build a deck
+            // at all. A refusal that names an alternative has to be in the same room as it.
+            tools.Add(Presentations.BuildTool(tfd, Images));
+            tools.Add(Downloads.Tool(tfd));
+            // Rooted at the conversation's files for the same reason file_summary is: an image the job was GIVEN
+            // is referred to by name, and a name has to resolve to something.
+            if (MediaDir is { Length: > 0 } md) tools.Add(Vision.Tool(md, tfd));
+        }
+
+        // The panel this task exists to build is published by this task and by nothing else. A tool that could
+        // overwrite any panel from any run is a tool that eventually does.
+        if (task.BuildsWidget is { Length: > 0 } && _widgets is not null && _kinds is not null)
+        {
+            if (task.FillsWidget)
+            {
+                tools.Add(WidgetLibraryTools.FillTool(_widgets, _kinds));
+            }
+            else if (task.PanelStep is { } state)
+            {
+                // One state's tools and no other state's. The research state holding a publish tool is the research
+                // state eventually publishing something it never proved.
+                tools.AddRange(PanelBuildTools.For(state, _widgets, new[]
+                {
+                    WidgetLibraryTools.DesignTool(_widgets),
+                    WidgetLibraryTools.PublishTool(_widgets, _kinds, _internalFeedFault, _provePanel),
+                }));
+            }
+            else
+            {
+                // Designing comes with publishing and never on its own: a run that could show a design but not
+                // publish one would leave a panel of invented numbers on the page with nothing coming.
+                tools.Add(WidgetLibraryTools.DesignTool(_widgets));
+                tools.Add(WidgetLibraryTools.PublishTool(_widgets, _kinds, _internalFeedFault, _provePanel));
+                // And a way to run a loader without publishing it. Publishing now refuses one that does not work,
+                // which is only half a capability while the only way to discover what DOES work is to publish and
+                // read the refusal. An adjust has no browser and no shell by design; this gives it the one thing it
+                // actually needed — the loader it already has, run, and the answer printed.
+                if (_provePanel is { } prover)
+                    tools.Add(WidgetLibraryTools.TryTool(_widgets, prover, _internalFeedFault));
+            }
+        }
+
+        // Setting up a watch is the same bargain as building a panel: the finding happens once, here, and the
+        // watching afterwards is free. So these belong to the job that did the finding and to nothing else — every
+        // worker having them would mean any run could quietly arrange to be woken up later.
+        if (task.SetsUpWatch && _feeds is not null && _watchers is not null && _readFeed is not null)
+        {
+            tools.Add(FeedTools.PublishTool(_feeds, _readFeed));
+            tools.Add(FeedTools.WatchTool(_watchers, _feeds));
+        }
+
+        // Repetition is the thing that actually exhausts a budget: the fiftieth item costs the same as the first
+        // because nothing carries over. This lets a worker that has LEARNED how to do one hand the rest off to a
+        // worker each. Withheld from fan-out children so the fan-out can't fan out.
+        if (!task.IsFanOutChild && _planner is not null) tools.Add(FanOutToolFor(session, task));
+
+        return tools;
+    }
+
+    // The top-level task a (possibly child STEP) task belongs to — the one whose re-voice speaks to the user.
+    // Deliveries are rolled up to it so a plan step's upload is known when the coordinator relays the result.
+    private static TaskInfo RootTask(Session session, TaskInfo task)
+    {
+        var t = task;
+        while (t.ParentTaskId is { } pid && session.Tasks.TryGetValue(pid, out var parent)) t = parent;
+        return t;
+    }
+
+    // Cancel a task AND any hidden child tasks it spawned (a multi-discipline plan runs each step as a child
+    // with its own run loop and token). Cancelling only the named task would leave an in-flight step grinding
+    // to completion and then delivering its result minutes later — so we cancel the whole tree at once.
+    private static void CancelTaskTree(Session session, TaskInfo t)
+    {
+        Cancel(t);
+        foreach (var child in session.Tasks.Values.Where(c => c.ParentTaskId == t.Id))
+            Cancel(child);
+
+        static void Cancel(TaskInfo task)
+        {
+            task.Status = "cancelled";
+            try { task.Cts.Cancel(); } catch { /* already disposed/cancelled — fine */ }
+        }
+    }
+
+    // The orchestrator resends its WHOLE conversation every turn — and again on each worker re-voice — so a long,
+    // intense thread balloons token cost roughly quadratically. Cap what we send to the model: keep all System
+    // seeds (channel, durable context) plus the last N user turns of detail, cutting at a clean user-message
+    // boundary so a tool-call/result pair is never split (a dangling call with no result can make a provider
+    // reject the request). Older detail drops off the PROMPT only — durable facts still live in the memory store
+    // and project context, and the full transcript is untouched. Short threads are sent whole.
+    private const int MaxRecentUserTurns = 12;
+    private const int HistoryWindowThreshold = 60;
+
+    private static IReadOnlyList<Message> WindowForModel(IReadOnlyList<Message> all)
+    {
+        if (all.Count <= HistoryWindowThreshold) return all;
+        int usersSeen = 0, cut = -1;
+        for (int i = all.Count - 1; i >= 0; i--)
+            if (all[i].Role == Role.User && ++usersSeen >= MaxRecentUserTurns) { cut = i; break; }
+        if (cut <= 0) return all; // fewer than N user turns despite the size — nothing safe to trim
+        var kept = new List<Message>(all.Count - cut + 8);
+        for (int i = 0; i < cut; i++) if (all[i].Role == Role.System) kept.Add(all[i]); // durable seeds
+        for (int i = cut; i < all.Count; i++) kept.Add(all[i]);                          // recent tail
+        return kept;
+    }
+
+    // Refresh a project's SHORT narrative summary — one or two sentences on where it stands, like telling a
+    // friend. Stored on the project (not a separate doc), regenerated in the background whenever it's touched.
+    // The rich facts carry the detail; this carries the story. Best-effort.
+    private async Task RegenerateSummaryAsync(string slug)
+    {
+        try
+        {
+            var p = _projects.Get(slug);
+            if (p is null) return;
+            var facts = ProjectEdges(slug, BrainContext.Unknown);
+
+            var state = new StringBuilder($"Project: {p.Title}");
+            if (!string.IsNullOrWhiteSpace(p.Description)) state.Append($" ({p.Description})");
+            state.Append('\n');
+            if (facts.Count == 0) state.Append("Nothing recorded yet.\n");
+            else
+                foreach (var f in facts.OrderBy(f => f.Relation, StringComparer.Ordinal))
+                    state.Append($"- {f.Relation}: {f.Value}\n");
+
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt =
+                    "In ONE or two sentences, say where this project stands, in a natural tone. Use ONLY the " +
+                    "facts given — do NOT invent numbers, names, tasks, or anything not listed (don't guess " +
+                    "what's 'left to do'). Plain prose: no bullets, headings, lists, emoji or fluff — the tone of " +
+                    "telling a friend where something stands. If barely started, one short line. Output only the " +
+                    "sentence(s).",
+                Messages = new List<Message> { Message.User(state.ToString().TrimEnd()) },
+                Tools = Array.Empty<AgentTool>(),
+                MaxOutputTokens = 120,
+                TurnTimeout = TimeSpan.FromSeconds(30),
+                Think = false,
+            };
+            var sb = new StringBuilder();
+            await foreach (var ev in _provider.StreamAsync(request, CancellationToken.None).ConfigureAwait(false))
+                if (ev is ModelStreamEvent.Content c) sb.Append(c.Text);
+            var text = sb.ToString().Trim();
+            if (text.Length > 0) { _projects.SetSummary(slug, text); Trace($"[summary] {slug} ({text.Length} chars)"); }
+        }
+        catch (Exception ex) { Trace($"[summary] {slug} failed: {ex.Message}"); }
+    }
+
+    // A short human label for a run ("Booked the venue", "Found 3 pubs"), generated in the background so the
+    // project overview can list adjustments as tidy titles instead of the verbose delegated-task text.
+    private async Task GenerateRunTitleAsync(string runId, string task, string? result)
+    {
+        try
+        {
+            var request = new ModelRequest
+            {
+                Model = _model,
+                SystemPrompt = "Reply with a 3-to-6 word title summarising what was done, in past tense " +
+                               "(e.g. \"Booked the venue\", \"Found 3 pubs\"). No quotes, no punctuation, no " +
+                               "preamble — just the title.",
+                Messages = new List<Message>
+                {
+                    Message.User($"Task: {task}\nResult: {Head(result ?? "", 400)}\n\nTitle:"),
+                },
+                Tools = Array.Empty<AgentTool>(),
+                MaxOutputTokens = 24,
+                TurnTimeout = TimeSpan.FromSeconds(30),
+                Think = false,
+            };
+            var sb = new StringBuilder();
+            await foreach (var ev in _provider.StreamAsync(request, CancellationToken.None).ConfigureAwait(false))
+                if (ev is ModelStreamEvent.Content c) sb.Append(c.Text);
+            var title = sb.ToString().Trim().Trim('"', '.', '\'').Trim();
+            if (title.Length is > 0 and <= 80) _runs.SetTitle(runId, title);
+        }
+        catch (Exception ex) { Trace($"[runtitle] {runId} failed: {ex.Message}"); }
+    }
+
+    // If the model's reasoning/reply names one of its tools by name but it called nothing, return that tool
+    // name (so we can nudge it to actually call it). Matches the literal tool identifiers (e.g. set_memory,
+    // find_project) on word boundaries — distinctive enough that plain chat won't trip it.
+    private static string? ReferencesUncalledTool(string content, string? reasoning, IReadOnlyList<AgentTool> tools)
+    {
+        // Only check content (what the model said to the user), not reasoning — the model
+        // often discusses tools in reasoning without intending to call them (e.g. "without
+        // needing to delegate"), causing false positives that clear valid replies.
+        var hay = content.ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(hay)) return null;
+        foreach (var t in tools)
+        {
+            var name = t.Name.ToLowerInvariant();
+            if (name == "delegate")
+            {
+                // For 'delegate', check if it's used as an active command rather than a negation/discussion.
+                // Ignore phrases like "no need to delegate", "don't delegate", etc.
+                var pattern = @"(?<!\b(no\s+need\s+to|not|don't|won't|can't|cannot|never|without|instead\s+of|rather\s+than|no)\s+)\bdelegate\b";
+                if (System.Text.RegularExpressions.Regex.IsMatch(hay, pattern))
+                    return t.Name;
+            }
+            else
+            {
+                if (System.Text.RegularExpressions.Regex.IsMatch(hay, $@"\b{System.Text.RegularExpressions.Regex.Escape(name)}\b"))
+                    return t.Name;
+            }
+        }
+
+        return null;
+    }
+
+    // Flatten a worker's message transcript into display steps: thinking blocks, tool calls (with their
+    // arguments and matched results), and the final answer — the read-only "what it did" timeline.
+    private static List<RunStep> BuildSteps(IReadOnlyList<Message> messages)
+    {
+        var steps = new List<RunStep>();
+        var toolById = new Dictionary<string, RunStep>(StringComparer.Ordinal);
+        foreach (var m in messages)
+        {
+            if (m.Role == Role.Assistant)
+            {
+                if (!string.IsNullOrWhiteSpace(m.Reasoning))
+                    steps.Add(new RunStep { Kind = "thinking", Text = m.Reasoning!.Trim() });
+                if (m.ToolCalls is { Count: > 0 })
+                    foreach (var c in m.ToolCalls)
+                    {
+                        var s = new RunStep { Kind = "tool", Tool = c.Name, Args = c.Arguments.ToString() };
+                        steps.Add(s);
+                        if (!string.IsNullOrEmpty(c.Id)) toolById[c.Id] = s;
+                    }
+                if (!string.IsNullOrWhiteSpace(m.Content))
+                    steps.Add(new RunStep { Kind = "answer", Text = m.Content!.Trim() });
+            }
+            else if (m.Role == Role.Tool)
+            {
+                if (m.ToolCallId is { } id && toolById.TryGetValue(id, out var s))
+                    s.Result = m.Content;
+                else
+                    steps.Add(new RunStep { Kind = "tool", Tool = m.ToolName, Result = m.Content });
+            }
+        }
+        return steps;
+    }
+
+    // Hand the worker any follow-ups the user routed to it while it was running, as steering notes.
+    private static IReadOnlyList<Message> DrainInbox(TaskInfo task)
+    {
+        if (task.Inbox.IsEmpty) return Array.Empty<Message>();
+        var msgs = new List<Message>();
+        while (task.Inbox.TryDequeue(out var m))
+            msgs.Add(Message.System(
+                $"While you've been working, the user sent a follow-up about this task: \"{m}\". " +
+                "Take it into account and adjust what you're doing accordingly."));
+        return msgs;
+    }
+
+    // Anchor the orchestrator in real time. Without this it drifts to its training-era "now" and treats
+    // the present as the future (e.g. "the 2026 World Cup hasn't happened yet"), and answers current-events
+    // questions from stale memory instead of delegating for live data.
+    /// <summary>The date and the user's whereabouts, for a WORKER's system prompt — the same two facts the
+    /// orchestrator gets in its per-turn block. Location is omitted entirely when there isn't one, so a worker
+    /// is never told about a position that doesn't exist.</summary>
+    private string HereAndNow()
+    {
+        var where = _locationNote?.Invoke() ?? "";
+        return DateContext() + (where.Length > 0 ? "\n" + where : "");
+    }
+
+    private static string DateContext()
+    {
+        var now = DateTime.Now;
+        return
+            $"\n\nToday is {now:dddd, d MMMM yyyy}. {now.Year} is the real present, not the future — never call a " +
+            "present or past date impossible, fictional, or not-yet-happened. You can't know current/live facts " +
+            "(news, scores, prices, weather, what's happening now) from memory; delegate to fetch anything live.";
+    }
+
+    /// <summary>
+    /// The one line about memory that goes into every turn: WHAT it knows about, never what it knows.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This replaced a retrieval step that guessed which facts mattered from the user's message BEFORE the model had
+    /// said what it wanted — plus a sticky per-conversation working set to paper over the guesses that missed. Both were
+    /// solving a problem the index does not have: the model does its own retrieval now, with search_memory, and all it
+    /// needed was to know there was something there to retrieve.
+    /// </para>
+    /// <para>
+    /// Which is the actual failure it fixes. A model told nothing does not think to look anything up — it answers from
+    /// thin air or says it doesn't know, and both are wrong when the answer was on file. Told there is a Majorca trip,
+    /// it asks about the Majorca trip. That is a tooling fix rather than an instruction, which is why it works.
+    /// </para>
+    /// </remarks>
+    private string ProfileNote(Session session)
+    {
+        var shape = _memory.Shape(session.Room.Room.Key);
+        if (shape.Length == 0) return "";
+
+        return "\n\nYou hold a memory of this person's world. It currently contains " + shape + " — and none of it is " +
+               "in front of you.\n" +
+               "Use search_memory to ask it anything about them, as a real question, in full. Record anything new with " +
+               "set_memory as a plain sentence. Do not answer a question about them from what you happen to remember of " +
+               "this conversation — look it up, because what is in there is the only thing that is actually known.\n";
+    }
+
+    /// <summary>
+    /// File every document this turn brought, against whatever the sentence turns out to be about.
+    /// </summary>
+    /// <remarks>
+    /// Fire and forget, and never in the way of the reply: filing is instant by design, and the graph work happens on the
+    /// queue afterwards. A failure here must not cost somebody their turn — it costs a document, which is why it is traced.
+    /// </remarks>
+    private void KeepWhatArrived(Session session, string said)
+    {
+        if (session.PendingAttachments is not { Count: > 0 } arrived) return;
+        if (ThreadFilesDir(session) is not { Length: > 0 } dir) return;
+
+        foreach (var file in arrived)
+        {
+            try
+            {
+                var path = Path.Combine(dir, file.Name);
+                if (!File.Exists(path)) continue;
+
+                _memory.Keep(said.Trim().Length > 0 ? said : $"a document called {file.Name}",
+                    path, file.Name, Said(session), session.Room.Room.Key);
+
+                Trace($"[brain] keeping {file.Name} that arrived with {Snip(said, 60)}");
+            }
+            catch (Exception ex)
+            {
+                Trace($"[brain] couldn't keep {file.Name}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// A file the conversation is holding, by name.
+    /// </summary>
+    /// <remarks>
+    /// Name only, resolved against this thread's own folder — so nothing can be kept from outside the conversation it was
+    /// offered in by writing a path instead of a filename.
+    /// </remarks>
+    private string? FileInThread(Session session, string name)
+    {
+        if (ThreadFilesDir(session) is not { Length: > 0 } dir) return null;
+
+        var bare = Path.GetFileName(name.Trim());
+        if (bare.Length == 0) return null;
+
+        var path = Path.Combine(dir, bare);
+        return File.Exists(path) ? path : null;
+    }
+
+    /// <summary>Where a filed sentence came from, so a fact can be traced back to who said it.</summary>
+    private static string? Said(Session session) =>
+        session.Room.Speaker.IsEmpty ? null : $"said by {session.Room.Speaker.Value}";
+
+    /// <summary>
+    /// Drop the words overheard this turn, because they turned out to be an instruction.
+    /// </summary>
+    /// <remarks>
+    /// Only while it is still waiting. Once the queue has been drained the sentence has already been read and this can
+    /// do nothing about it — which is fine, because delegation happens within the same turn, long before the drain.
+    /// </remarks>
+    private void ForgetWhatWasOverheard(Session session)
+    {
+        if (session.OverheardThisTurn is not { Length: > 0 } id) return;
+
+        session.OverheardThisTurn = null;
+        if (_memory.Discard(id)) Trace("[brain] that was a request, not a statement — not filing it");
+    }
+
+    /// <summary>
+    /// What is known about something on a list, in one clause.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The whole reason for joining list items to nodes. A list of restaurants cannot answer "where should we go
+    /// tonight" — but a list whose items carry what the graph holds can: this one has been sitting there since March and
+    /// never been visited, that one you went to in June, the other has a table booked on Friday. The list supplies the
+    /// shortlist; this supplies the reason to pick one.
+    /// </para>
+    /// <para>
+    /// How long it has been on file comes from when each fact was ASSERTED, which is already stored — "wanted to go for
+    /// years" needs no new field, only for somebody to look at the date the claim was first made.
+    /// </para>
+    /// <para>
+    /// Kept to a clause, because ten items each printing their neighbourhood is a wall of text nobody reads and the point
+    /// is for ONE of them to stand out.
+    /// </para>
+    /// </remarks>
+    private string? Holds(string nodeId)
+    {
+        if (_memory.Graph.Get(nodeId) is not { } node) return null;
+
+        var parts = new List<string>();
+
+        var facts = _memory.Graph.Around(node.Id)
+            .Where(step => !step.Edge.Label.Equals("is", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(step => step.Edge.Asserted)
+            .ToList();
+
+        if (facts.FirstOrDefault() is { Edge: not null } first)
+        {
+            var months = (DateTimeOffset.UtcNow - first.Edge.Asserted).TotalDays / 30.0;
+            var age = months >= 1 ? $", on file since {first.Edge.Asserted:MMM yyyy}" : "";
+            parts.Add($"{first.Edge.Label} {first.To.Name}{age}");
+        }
+
+        if (facts.Count > 1) parts.Add($"{facts.Count} facts on file");
+
+        return parts.Count == 0 ? null : string.Join("; ", parts);
+    }
+
+    /// <summary>Focus the conversation on a project, and mark it just-touched so the focus starts fresh.</summary>
+    private static void FocusProject(Session session, string slug)
+    {
+        session.CurrentProject = slug;
+        session.TurnsSinceProjectTouched = 0;
+    }
+
+    /// <summary>
+    /// How many turns a project focus survives without anything touching it. Two turns of grace, so a follow-up
+    /// ("and what about the flights?") still lands in context, then it fades.
+    /// </summary>
+    /// <summary>
+    /// How many things one finished run may record.
+    /// </summary>
+    /// <remarks>
+    /// A ceiling on COUNT, kept because the ceiling on LENGTH only changed the shape of the noise: told each memory
+    /// must fit in a hundred characters, a run stopped writing long ones and started writing eight short ones — one
+    /// eBay listing filed its url, price, condition, photo count and returns policy as durable project facts. Three
+    /// forces a choice, and a run that genuinely settled more than three things is far rarer than a run summarising
+    /// itself. The run is recorded either way.
+    /// </remarks>
+
+    private const int ProjectFocusGraceTurns = 3;
+
+    // The READ side of project focus: once find_project has resolved a reference, surface that project's
+    // relevant facts in chat so the orchestrator can answer about it without delegating — and remind it that
+    // recording a new detail goes THROUGH the project (a task), not set_memory up here. Writes are routed;
+    // reads are surfaced.
+    //
+    // It used to say "you're currently focused on X", with that project's details, on EVERY turn for the rest of
+    // the conversation — and told the model to drop the focus when the talk moved on, which it had no way to do.
+    // The result was every later question answered as though it were about the project, however little it had to
+    // do with it. So the focus now fades on its own, and while it lasts it reads as context rather than as the
+    // subject: the details are there if the message relates to them, and ignorable if it doesn't.
+    // Public because the per-turn context it produces is assembled into a COPY of the history and never persisted,
+    // so what the model was shown can't be read back off the session afterwards. This is the seam where the
+    // wording and the fade can actually be checked.
+    public async Task<string> ProjectFocusNote(Session session, string message, CancellationToken ct)
+    {
+        var slug = session.CurrentProject;
+        if (string.IsNullOrEmpty(slug)) return "";
+        var p = _projects.Get(slug);
+        if (p is null) { session.CurrentProject = null; return ""; } // project gone — drop the stale focus
+
+        if (session.TurnsSinceProjectTouched >= ProjectFocusGraceTurns)
+        {
+            session.CurrentProject = null; // nothing has touched it for a while; the conversation has moved on
+            return "";
+        }
+
+        var today = DateOnly.FromDateTime(DateTime.Now.Date);
+        var window = p.WindowNote(today);
+
+        var sb = new StringBuilder(
+            $"\n\n[This conversation has been about the project \"{p.Title}\" (slug: {slug}" +
+            (window.Length > 0 ? $", {window}" : "") + "). Use that if this " +
+            "message relates to it; if it doesn't, just answer what was actually asked. To record a new detail " +
+            "about the project, delegate it into the project — its worker records it with the project's " +
+            "context — rather than set_memory here.");
+
+        // The end date has passed, so this is history. Said plainly, because the failure it prevents is quiet:
+        // answering "sort out my meal prep" with the plan from a fortnight ago, and nobody noticing why.
+        if (p.HasEnded(today))
+            sb.Append(" NOTE: its dates have passed — it is a record of what was planned for that period, not " +
+                      "something still running. If they're asking about this subject NOW, that's a new period " +
+                      "and wants its own project; don't edit or extend this one to cover it.");
+
+        // How much is recorded, and not a word of what it says. The details themselves used to be here, and they were
+        // memories sitting in a prompt: read off without asking, and in the context of every turn whether or not the turn
+        // was about this project. A count says there is something to look up, which is all a prompt has any business doing.
+        if (ProjectEdges(slug, session.Room).Count is > 0 and var known)
+            sb.Append($"\n{known} thing(s) recorded about it — search_memory to read any of them");
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    // The dedicated project chat: this whole conversation is about ONE project. Surface its details and hold
+    // the model to it — only this project's topic, and a polite deflection for anything unrelated.
+    private async Task<string> PinnedProjectNote(Session session, string message, CancellationToken ct)
+    {
+        var slug = session.PinnedProject;
+        if (string.IsNullOrEmpty(slug)) return "";
+        var p = _projects.Get(slug);
+        if (p is null) { session.PinnedProject = null; session.CurrentProject = null; return ""; }
+
+        var sb = new StringBuilder($"\n\nThis is the DEDICATED chat for the project \"{p.Title}\"");
+        if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($": {p.Description}");
+        sb.Append(".\nTalk ONLY about this project — its planning, details, and getting things done for it. " +
+                  "Record details and delegate work to THIS project. If the user asks about anything not " +
+                  "related to it, briefly say this is the project's space and they can use the main chat for " +
+                  "other things — don't act on unrelated requests here.\n");
+        if (ProjectEdges(slug, session.Room).Count is > 0 and var known)
+            sb.Append($"{known} thing(s) are recorded about it. Use search_memory to read them — do not answer about " +
+                      "this project from anything but what you looked up.\n");
+        return sb.ToString();
+    }
+
+    // When a worker runs inside a project, give it the project's framing + accumulated facts, and reframe
+    // memory toward tracking the project rather than the user.
+    private string ProjectContext(string? slug, BrainContext room)
+    {
+        if (string.IsNullOrEmpty(slug)) return "";
+        var p = _projects.Get(slug);
+        if (p is null) return "";
+
+        var sb = new StringBuilder($"\n\nYou are working inside the project \"{p.Title}\"");
+        if (!string.IsNullOrWhiteSpace(p.Description)) sb.Append($": {p.Description}");
+        sb.Append(".\nUse memory here to track details about THIS PROJECT (decisions, dates, findings) — not facts about the user.\n");
+
+        if (ProjectEdges(slug, room).Count is > 0 and var known)
+            sb.Append($"{known} thing(s) are already recorded about it. Read them with search_memory before doing work " +
+                      "that assumes otherwise, and before asking anybody for something that may already be known.\n");
+        return sb.ToString();
+    }
+
+    // The worker-side persona framing: the role's expertise prompt, plus a "how to use it" hint for each
+    // capability that actually produced tools (so it's only told about integrations it really has). Empty when
+    // the task has no persona or personas aren't wired.
+    private string PersonaContext(TaskInfo task)
+    {
+        if (task.Persona is not { } pid || _personas?.Get(pid) is not { } persona) return "";
+        var sb = new StringBuilder($"\n\nYou are working as the {persona.Name}.\n{persona.SystemPrompt}\n");
+        if (_capabilities is { } caps)
+            foreach (var hint in caps.ActiveHints(persona.CapabilityIds, _integrationConfig, task))
+                sb.Append($"- {hint}\n");
+        return sb.ToString();
+    }
+
+    // The persona roster surfaced to the orchestrator. Routing is now delegate's job — a background triage
+    // picks the right specialist(s) and, for a cross-discipline job, plans a sequence of them. So the
+    // orchestrator should NOT hand-pick: it just delegates the work. The only time it passes `persona` is when
+    // the user explicitly names a role ("ask the software engineer…"). Empty when no personas are configured.
+    private string PersonaNote()
+    {
+        if (_personas is null) return "";
+        var all = _personas.All;
+        if (all.Count == 0) return "";
+        var sb = new StringBuilder("\n\nWhen you delegate, the work is automatically routed to the right " +
+                                   "specialist — and a task that spans several disciplines is planned as a " +
+                                   "sequence of them. So just delegate the work plainly; do NOT pick a specialist " +
+                                   "yourself. Only pass `persona` when the user explicitly names a role. The " +
+                                   "available specialists (for your awareness only):\n");
+        foreach (var p in all)
+            sb.Append($"- {p.Id} ({p.Name}): {p.Description}\n");
+        return sb.ToString();
+    }
+
+    // The brands managed here (house + any client brand kits), surfaced so the orchestrator can talk about them
+    // and knows new branding work can either use an existing brand or become a new one (promote_file brand:<slug>).
+    // Empty when no workspace root (no buckets) — and quietly omitted when only the house brand exists yet.
+    private string BrandsNote()
+    {
+        if (BrandsRootDir() is null) return "";
+        var slugs = BrandSlugs();
+        var clients = slugs.Where(s => !string.Equals(s, "house", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (clients.Count == 0) return "";
+        var sb = new StringBuilder("\n\nBrand kits available for branding work (the agency's own is \"house\"):\n");
+        sb.Append("- house (your own brand)\n");
+        foreach (var c in clients) sb.Append($"- {c}\n");
+        sb.Append("Branding work is automatically matched to the right brand. To save an approved new brand (or " +
+                  "update one), use promote_file with scope \"brand:<slug>\".\n");
+        return sb.ToString();
+    }
+
+    // A compact roster (id: one-liner) handed to the planner's triage/step/route calls. Kept lean on purpose —
+    // routing reads ids and a short description, never the full system prompts, so the gate stays cheap.
+    /// <summary>
+    /// What a panel build actually uses.
+    ///
+    /// <para>
+    /// Named rather than derived, because the set is small and the point is that it is small. A build reads a page or
+    /// an API, looks at what came back, maybe takes a screenshot, and publishes. It does not need this repository's
+    /// source, a presentation builder, the memory store or a file downloader — and every one of those it was given,
+    /// it eventually tried.
+    /// </para>
+    /// </summary>
+    private static readonly HashSet<string> BuildTools = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // The panel tools themselves are kept by NAME PREFIX, in PanelBuild.Keep, not listed here. Listing them cost
+        // a whole feature silently: widget_design was added to the build's toolset and trimmed straight back out by
+        // this set, so the worker was told to design first and handed no way to do it. Nothing failed — the panel
+        // simply appeared the old way, and the only evidence was a tool that never got called.
+        // The guides: what was learned about a source the last time one of these was built against it.
+        "task_guides",
+        // Its own workspace, so a long build can put what a feed returned in a file instead of carrying it.
+        "read_file", "write_file", "list_files", "find_in_file",
+        // The browser, for reading a page and for watching what its own front end calls.
+        "chrome_tabs_context", "chrome_tabs_create", "chrome_tabs_close", "chrome_navigate", "chrome_read_page",
+        "chrome_find", "chrome_click", "chrome_type_text", "chrome_press_key", "chrome_scroll",
+        "chrome_javascript", "chrome_read_network", "chrome_read_console", "chrome_screenshot", "chrome_images",
+        "chrome_grab_image", "chrome_inspect",
+    };
+
+    private string PersonaRoster()
+    {
+        if (_personas is null) return "";
+        var sb = new StringBuilder();
+        foreach (var p in _personas.All)
+            sb.Append($"- {p.Id}: {p.Description}\n");
+        return sb.ToString();
+    }
+
+    // A live snapshot of in-flight tasks, appended to the system prompt so the orchestrator always knows
+    // what it has running (and their ids) — even across turns, so "cancel that" / "how's it going" work.
+    private static string RunningTasksNote(Session session)
+    {
+        var running = session.Tasks.Values.Where(t => t.IsRunning && t.ParentTaskId is null)
+            .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
+        if (running.Count == 0) return "";
+        var sb = new StringBuilder("\n\nTasks ALREADY running in the background (refer to them by id):\n");
+        foreach (var t in running)
+            sb.Append($"- #{t.Id}: {t.Description}\n");
+        sb.Append("Don't delegate anything that overlaps one of these — it's already being done. If the user " +
+                  "is adding to one, delegate ONLY the genuinely new part (or steer it with message_task).\n" +
+                  "If the user is just CHASING a running task — \"hurry up\", \"ship it\", \"you done?\", \"any " +
+                  "progress?\" — do NOT start another task and do NOT re-delegate the same work (that spawns a " +
+                  "confusing duplicate and wastes the in-flight one). Either pass the nudge to it with " +
+                  "message_task, or simply reassure them it's still going. Starting over is almost never right.\n");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Tasks that stopped to ASK something, and what they asked.
+    ///
+    /// <para>
+    /// These appeared in no note at all: the running note is <c>status == "running"</c> and the finished note is
+    /// done/failed, so a waiting task fell between them and the orchestrator never knew a question was
+    /// outstanding. Answering in the chat — the obvious thing to do — went nowhere, because as far as the model
+    /// was concerned nothing had been asked. The question card was the only route in, and three of them stacked
+    /// up unanswered.
+    /// </para>
+    /// <para>
+    /// With the question in front of it, an ordinary reply is routed with message_task, which is what the user
+    /// meant by typing it. A message that plainly isn't an answer still isn't one — the note says which task is
+    /// asking what, and leaves the reading of it where it belongs.
+    /// </para>
+    /// </summary>
+    private static string WaitingTasksNote(Session session)
+    {
+        var waiting = session.Tasks.Values
+            .Where(t => t.Status == "waiting" && t.ParentTaskId is null && t.Pending is not null)
+            .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
+        if (waiting.Count == 0) return "";
+
+        var sb = new StringBuilder("\n\nPAUSED, waiting on an answer from the user:\n");
+        foreach (var t in waiting)
+        {
+            sb.Append($"- #{t.Id} asked: \"{Head(t.Pending!.Question, 160)}\"");
+            if (t.Pending.Options is { Count: > 0 } opts)
+                sb.Append($" (suggested: {string.Join(" / ", opts.Take(4))})");
+            sb.Append('\n');
+        }
+        sb.Append(
+            "If what the user just said answers one of these — including a plain \"yes\", one of the suggested " +
+            "options, or an answer in their own words — pass it to that task with message_task and say one short " +
+            "line confirming. Do NOT re-ask, and do NOT start a new task for work that is already paused mid-way " +
+            "through. They should never have to use a particular box to be heard.\n");
+        return sb.ToString();
+    }
+
+    // Tasks in this thread that have FINISHED but can be re-opened. A worker resumes from its own saved
+    // transcript, so reopening keeps everything it already did (data loaded, files produced, code written) and
+    // just adjusts — far cheaper and better than redoing the job. Surfaced so the model refines instead of
+    // re-delegating when the user iterates on a result.
+    private static string FinishedTasksNote(Session session)
+    {
+        // Interrupted and cancelled belong here too. Listing only done/failed made a task cut off by a restart
+        // invisible: nothing said it existed, so "continue that" found nothing to continue and started again
+        // from nothing — which is what happened to a listing that was one field from finished.
+        var finished = session.Tasks.Values
+            .Where(t => t.ParentTaskId is null && t.Status is not ("running" or "waiting") && Resumable(t.Status))
+            .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
+        if (finished.Count == 0) return "";
+        var sb = new StringBuilder("\n\nStopped tasks in this thread (re-open one with message_task — DON'T start over):\n");
+        foreach (var t in finished)
+        {
+            sb.Append($"- #{t.Id} [{t.Status}]: {Snip(t.Description, 140)}");
+
+            // What it actually came back with, in a line.
+            //
+            // The status alone says the worker stopped, not that the work happened: a run that reported "I have
+            // no browser, I can't do this" was listed as [done] with nothing to distinguish it from a success. So
+            // "try again" had no failure to find here and went looking elsewhere. A few words of the result make
+            // an empty outcome visible at the point the decision is made.
+            if (!string.IsNullOrWhiteSpace(t.Result))
+                sb.Append($" → \"{Head(t.Result!, 60)}\"");
+            sb.Append('\n');
+        }
+        sb.Append("An [interrupted] or [cancelled] one stopped part-way with everything it had learned still " +
+                  "recorded; message_task picks it up from there. Never tell the user a task can't be resumed.\n");
+        sb.Append("When the user iterates on what one of these produced — \"make it cleaner\", \"more pink\", " +
+                  "\"add a chart\", \"try again\" — message_task that id with just the change. The worker picks up " +
+                  "with all its prior context and adjusts (e.g. tweaks and re-renders the report) instead of " +
+                  "rebuilding from scratch. Only delegate a NEW task for genuinely new work.\n");
+        return sb.ToString();
+    }
+
+    // The panel tools, as SCHEMAS — built with no session, because at construction time there isn't one. The
+    // live ones are rebuilt against the session in HandleToolCall, the same way the list tools are.
+    private static IEnumerable<AgentTool> WidgetSchemas(WidgetStore? widgets, WidgetLibrary? kinds) =>
+        widgets is null || kinds is null
+            ? Array.Empty<AgentTool>()
+            : new[]
+                {
+                    WidgetLibraryTools.AddTool(widgets, kinds, () => null, (_, _, _, _) => Task.FromResult("")),
+                    WidgetTools.BuildTool(widgets, () => null, (_, _) => Task.FromResult("")),
+                }
+                .Concat(WidgetTools.Manage(widgets));
+
+    // Setting up a watch, as a SCHEMA — the live one is rebuilt against the session in HandleToolCall, exactly as the
+    // panel and list tools are, because at construction time there is no session to start a task in.
+    private static IEnumerable<AgentTool> WatchSchemas(FeedStore? feeds, WatcherStore? watchers) =>
+        feeds is null || watchers is null
+            ? Array.Empty<AgentTool>()
+            : new[] { FeedTools.WatchForTool((_, _) => Task.FromResult("")) };
+
+    /// <summary>
+    /// Tell the conversation that made a panel that the panel has gone.
+    ///
+    /// <para>
+    /// The gap this closes is the one that made the flight tracker look broken. It was built three times and
+    /// removed from the page each time, and the conversation was never told — so its history held four of the
+    /// assistant's own messages saying the panel was live. Asked a fourth time, the model read its transcript,
+    /// concluded the job was done, and said so again without calling anything. That is a correct reading of a
+    /// record nobody had corrected: it was not confused about which tool to use, it thought there was nothing
+    /// left to do.
+    /// </para>
+    /// <para>
+    /// So a change made on the PAGE is written back into the conversation that caused it, the same way a finished
+    /// task is. Nothing here is about honesty or phrasing — it is about the transcript matching the world.
+    /// </para>
+    /// </summary>
+    /// <summary>
+    /// Drop a question without answering it, and stop the job that asked.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The one thing a waiting task could not be told. It could be answered, and that was all — so a question about
+    /// something the user had already given up on sat on the home page with no way off it, and the only route out was
+    /// to answer a job you did not want finished. A panel the user declined kept asking how to build itself.
+    /// </para>
+    /// <para>
+    /// Cancels the tree rather than only clearing the question: leaving the task running would have it ask the next
+    /// thing a minute later, which is the same problem with a delay on it.
+    /// </para>
+    /// </remarks>
+    public bool DismissQuestion(Session session, string taskId)
+    {
+        taskId = (taskId ?? "").TrimStart('#').Trim();
+        if (!session.Tasks.TryGetValue(taskId, out var task)) return false;
+
+        task.Pending = null;
+        CancelTaskTree(session, task);
+        Trace($"[task {taskId}] dismissed without an answer — cancelled");
+        return true;
+    }
+
+    /// <summary>
+    /// Stop whatever is building a panel, because the panel is gone.
+    /// </summary>
+    /// <remarks>
+    /// Removing a panel used to tell the conversation and nothing else, so a build already in flight carried on
+    /// against a panel that no longer existed: it finished its work, could not publish — "no panel 1c6941ff" — and
+    /// asked the user what to do about it. The job has to be told the same moment the page is.
+    /// </remarks>
+    public int CancelBuildsFor(Session session, string panelId)
+    {
+        var stopped = 0;
+        foreach (var task in session.Tasks.Values.Where(t => t.IsRunning && t.BuildsWidget == panelId).ToList())
+        {
+            task.Pending = null;
+            CancelTaskTree(session, task);
+            stopped++;
+        }
+
+        if (stopped > 0) Trace($"[widget] {panelId} removed — cancelled {stopped} build(s) still working on it");
+        return stopped;
+    }
+
+    public void PanelRemoved(Session session, string title)
+    {
+        session.History.Add(Message.System(
+            $"The user has just removed the \"{title}\" panel from their home page. It is no longer there. If they " +
+            "ask for it again, it has to be built again — anything you said earlier about it being live is now out " +
+            "of date."));
+        Trace($"[widget] told {session.Id} that \"{title}\" was removed");
+    }
+
+    /// <summary>
+    /// Send a worker to build a panel.
+    ///
+    /// <para>
+    /// An ordinary background task, which is the point — it gets the browser, the planner, the guides learned from
+    /// every previous build, the watchdog, and a place in the task list the user can watch and cancel. Finding a
+    /// live data feed for a flight is real work and it was never going to be a tool call.
+    /// </para>
+    /// </summary>
+    /// <summary>
+    /// How many running tasks were given the browser.
+    ///
+    /// <para>
+    /// Counted because the tabs belong to the CONNECTION, not to a task: two tasks browsing at once share one group,
+    /// so the first to finish must not close the other's tabs out from under it. Cleanup happens when the last one
+    /// leaves.
+    /// </para>
+    /// </summary>
+    private int _browsing;
+
+    /// <summary>
+    /// Close every tab this process opened in Chrome, once nothing is still using it.
+    ///
+    /// <para>
+    /// Nothing did this, and it showed. Every worker that touched the browser left its tabs open, so a day's work
+    /// left a wall of them; and because the extension keys a tab group to the MCP connection, every restart of this
+    /// process started a fresh group and orphaned the last one. The user is USING that browser — leaving tabs in it
+    /// is not a tidiness problem, it is walking through someone's house in muddy boots.
+    /// </para>
+    /// <para>
+    /// The extension removes a group when its last tab goes, so closing the tabs takes the group with it. No model
+    /// involved: list the group's tabs, close them.
+    /// </para>
+    /// </summary>
+    private async Task TidyBrowserAsync()
+    {
+        // Someone else is mid-page. Their tabs are not ours to close.
+        if (Interlocked.Decrement(ref _browsing) > 0) return;
+        if (_capabilities is null) return;
+
+        try
+        {
+            var probe = new TaskInfo { Id = "tidy", Description = "close the tabs this run opened" };
+            var tools = Browser(probe);
+            AgentTool? Find(string suffix) =>
+                tools.FirstOrDefault(t => t.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+
+            if (Find("tabs_context") is not { } context || Find("tabs_close") is not { } close) return;
+
+            var listing = await context.InvokeAsync(Args(new { createIfEmpty = false }), CancellationToken.None)
+                .ConfigureAwait(false);
+            if (listing.IsError || string.IsNullOrWhiteSpace(listing.Content)) return;
+
+            var ids = TabIds(listing.Content);
+            if (ids.Count == 0) return;
+
+            foreach (var id in ids)
+                await close.InvokeAsync(Args(new { tabId = id }), CancellationToken.None).ConfigureAwait(false);
+
+            Trace($"[browser] closed {ids.Count} tab(s) left over from this run");
+        }
+        catch (Exception ex)
+        {
+            // Tidying is a courtesy. It must never be the thing that fails a finished task.
+            Trace($"[browser] couldn't tidy up: {ex.Message}");
+        }
+    }
+
+    /// <summary>Every tab id in a tabs_context answer.</summary>
+    private static List<int> TabIds(string content)
+    {
+        var ids = new List<int>();
+        try
+        {
+            using var doc = JsonDocument.Parse(content);
+            if (doc.RootElement.TryGetProperty("availableTabs", out var tabs) &&
+                tabs.ValueKind == JsonValueKind.Array)
+                foreach (var t in tabs.EnumerateArray())
+                    if (t.TryGetProperty("tabId", out var id) && id.TryGetInt32(out var value))
+                        ids.Add(value);
+        }
+        catch { /* nothing addressable in there */ }
+        return ids;
+    }
+
+    /// <summary>
+    /// Load a page in the user's own Chrome and read one expression out of it.
+    ///
+    /// <para>
+    /// The browser earns its place twice. Large sites refuse a plain server request outright — eBay answers 403 to
+    /// curl and to us, with any headers — and the interesting data on the user's OWN listing (what it sold for, who
+    /// is watching it) is only visible to someone signed in as them. Their Chrome is signed in as them.
+    /// </para>
+    /// <para>
+    /// No model involved: the two browser tools are invoked directly, with a url and an expression that were both
+    /// settled when the panel's kind was built. It is an automation, not an agent.
+    /// </para>
+    /// </summary>
+    public async Task<string?> ReadPageAsync(string url, string expression, CancellationToken ct)
+    {
+        if (_capabilities is null) return null;
+
+        var probe = new TaskInfo { Id = "widget", Description = "load a page for a home-page panel" };
+        var tools = Browser(probe);
+        AgentTool? Find(string suffix) =>
+            tools.FirstOrDefault(t => t.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase));
+
+        var navigate = Find("navigate");
+        var evaluate = Find("javascript");
+        if (navigate is null || evaluate is null) return null;
+
+        // One tab, reused, and closed at the end. Two things this gets right that the obvious version doesn't: it
+        // never navigates the tab the user is looking at (that is a hijack, not a refresh), and it never leaves a new
+        // tab behind every few minutes — which, at one panel refreshing every five, is a wall of them by lunchtime.
+        int? tab = null;
+        if (Find("tabs_context") is { } context)
+        {
+            var listing = await context.InvokeAsync(Args(new { createIfEmpty = true }), ct).ConfigureAwait(false);
+            tab = TabIds(listing.Content ?? "").FirstOrDefault() is var first and > 0 ? first : null;
+        }
+
+        // Only if there wasn't one already.
+        if (tab is null && Find("tabs_create") is { } open)
+        {
+            var made = await open.InvokeAsync(Args(new { url }), ct).ConfigureAwait(false);
+            tab = TabId(made.Content);
+        }
+
+        try
+        {
+            var landed = await navigate.InvokeAsync(
+                Args(tab is { } nt ? new { url, tabId = nt } : (object)new { url }), ct).ConfigureAwait(false);
+            if (landed.IsError) return null;
+
+            // Wait for the page to actually be there before reading it. Without this the expression runs against a
+            // half-built document and every selector misses — which is not an error, it is a panel full of nulls,
+            // which is worse. Polled rather than a fixed sleep, so a fast page costs a fraction of a second and a
+            // slow one still works.
+            for (int attempt = 0; attempt < 16; attempt++)
+            {
+                var state = await evaluate.InvokeAsync(
+                    Args(tab is { } rt
+                        ? new { expression = "document.readyState", tabId = rt }
+                        : (object)new { expression = "document.readyState" }),
+                    ct).ConfigureAwait(false);
+
+                if (state.Content?.Contains("complete", StringComparison.OrdinalIgnoreCase) == true) break;
+                await Task.Delay(500, ct).ConfigureAwait(false);
+            }
+
+            var read = await evaluate.InvokeAsync(
+                Args(tab is { } t ? new { expression, tabId = t } : (object)new { expression }),
+                ct).ConfigureAwait(false);
+            if (read.IsError || string.IsNullOrWhiteSpace(read.Content)) return null;
+
+            return Unwrap(read.Content);
+        }
+        finally
+        {
+            // Parked on a blank page rather than closed. The next refresh reuses this tab, so the browser holds one
+            // tab for all panel loading however many panels there are — and a blank tab is not sitting on the user's
+            // eBay listing showing them their own page.
+            if (tab is { } t)
+                await navigate.InvokeAsync(Args(new { url = "about:blank", tabId = t }), CancellationToken.None)
+                    .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>The javascript tool answers {"value": …}; the panel wants what is inside it.</summary>
+    private static string? Unwrap(string content)
+    {
+
+        try
+        {
+            using var doc = JsonDocument.Parse(content);
+            if (doc.RootElement.TryGetProperty("value", out var value))
+                return value.ValueKind == JsonValueKind.String ? value.GetString() : value.GetRawText();
+        }
+        catch { /* not the shape we expected — fall through and hand back what came */ }
+
+        return content;
+    }
+
+    /// <summary>The tab id out of a tabs_create answer, so the page can be read and closed by id.</summary>
+    private static int? TabId(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(content);
+            foreach (var name in new[] { "tabId", "id" })
+                if (doc.RootElement.TryGetProperty(name, out var v) && v.TryGetInt32(out var id)) return id;
+
+            // Some answers carry the new tab inside the group listing.
+            if (doc.RootElement.TryGetProperty("availableTabs", out var tabs) &&
+                tabs.ValueKind == JsonValueKind.Array && tabs.GetArrayLength() > 0 &&
+                tabs[tabs.GetArrayLength() - 1].TryGetProperty("tabId", out var last) &&
+                last.TryGetInt32(out var lastId))
+                return lastId;
+        }
+        catch { /* no id to be had; the caller falls back to the group's first tab */ }
+        return null;
+    }
+
+    private static ToolCallArguments Args(object value) =>
+        new(JsonDocument.Parse(JsonSerializer.Serialize(value)).RootElement.Clone());
+
+    /// <summary>
+    /// Send a worker to establish a parameter value the user didn't give.
+    ///
+    /// <para>
+    /// "Track my latest eBay listing" names no item number, and the item number is a fact about the world. The
+    /// panel goes up immediately saying it is being worked out, a worker goes and finds the value, and the panel
+    /// fills in — rather than the assistant asking the user for something it could have looked up.
+    /// </para>
+    /// </summary>
+    private Task<string> ResolveWidgetParamsAsync(Session session, Widget widget, WidgetKind kind,
+        IReadOnlyList<WidgetParam> missing, string find)
+    {
+        var wanted = string.Join("\n", missing.Select(p =>
+            $"- {p.Name}: {p.Description}" + (p.Example is { Length: > 0 } e ? $" (e.g. {e})" : "")));
+
+        var task = StartTask(session,
+            $"Establish the missing parameter(s) for the home-page panel \"{widget.Title}\" (id {widget.Id}), " +
+            $"which is an instance of the {kind.Name} kind.\n\nWhat has to be found: {find}\n\n" +
+            $"The parameter(s) still needed:\n{wanted}\n\n" +
+            "Go and find the actual value — the browser and everything else is available. Then call widget_fill " +
+            "with the panel id and the values. The component and the feed already exist; you are only supplying " +
+            "the values, so do NOT write a component and do NOT call widget_publish.\n" +
+            "If you genuinely cannot establish it, say so plainly and stop.");
+
+        task.BuildsWidget = widget.Id;
+        task.FillsWidget = true;
+        _widgets?.Building(widget.Id, task.Id);
+        Trace($"[widget] {widget.Id} resolving {string.Join(", ", missing.Select(p => p.Name))} -> task {task.Id}");
+        return Task.FromResult(task.Id);
+    }
+
+    /// <summary>
+    /// Send a worker to CHANGE a panel rather than build one. Briefed with the component it is editing.
+    /// </summary>
+    public Task<string> AdjustWidgetAsync(Session session, Widget widget, WidgetKind? kind, string note)
+    {
+        var task = StartTask(session, WidgetTools.AdjustBrief(widget, kind, note));
+        task.BuildsWidget = widget.Id;
+        task.AdjustsWidget = true;
+        _widgets?.Building(widget.Id, task.Id);
+        Trace($"[widget] {widget.Id} \"{widget.Title}\" adjust -> task {task.Id}: {Snip(note, 80)}");
+        return Task.FromResult(task.Id);
+    }
+
+    /// <summary>
+    /// Start a plain background job in a conversation: a brief handed to a worker, not a message to the assistant.
+    ///
+    /// <para>
+    /// The distinction matters and cost a renewal. A project rolling over was driven through the scheduled-message
+    /// path, which talks to the CHAT VOICE — whose job is to reply and delegate. It replied ("On the case") and
+    /// delegated nothing, so the new week's dinners were never planned and the conversation held one message and zero
+    /// tasks. A job that must actually happen is given to a worker directly.
+    /// </para>
+    /// </summary>
+    public Task<string> StartWorkAsync(Session session, string brief, string? project = null)
+    {
+        var task = StartTask(session, brief, project);
+        Trace($"[work] {session.Id} -> task {task.Id}: {Snip(brief, 90)}");
+        return Task.FromResult(task.Id);
+    }
+
+    /// <summary>
+    /// Go and find something that keeps producing, and set up the watch on it.
+    /// </summary>
+    /// <remarks>
+    /// A background job for the same reason a panel build is one: the answer to "what could tell us when this happens"
+    /// is an address nobody has yet, and finding it means reading pages. It happens once, and what it leaves behind
+    /// costs a request on a timer.
+    /// </remarks>
+    public Task<string> WatchForAsync(Session session, string what, string act)
+    {
+        var known = _feeds is not null && _watchers is not null ? FeedTools.Note(_feeds, _watchers) : "";
+        var task = StartTask(session, FeedTools.Brief(what, act, known));
+        task.SetsUpWatch = true;
+        Trace($"[watch] setting up \"{Snip(what, 60)}\" -> task {task.Id}");
+        return Task.FromResult(task.Id);
+    }
+
+    /// <summary>
+    /// Proact, going to do something it decided on by itself.
+    /// </summary>
+    /// <remarks>
+    /// A task rather than a bespoke agent loop, so it inherits everything a delegated task already has: a workspace,
+    /// a trace in the control centre, a spend figure, cancellation, and recovery after a restart. What makes it
+    /// different is only the flag — which takes its tools away (see <see cref="Session"/>'s <c>Proact</c>) — and the
+    /// fact that no human is waiting for the answer, so there is nobody to report back to and nothing to say.
+    /// </remarks>
+    public Task<string> RunProactAsync(Session session, string mode, string brief)
+    {
+        var task = StartTask(session, brief, persona: "proact");
+        task.Proact = mode;
+        Trace($"[proact] {mode} -> task {task.Id}");
+        return Task.FromResult(task.Id);
+    }
+
+    /// <summary>
+    /// Carry out a proposal the user ticked.
+    /// </summary>
+    /// <remarks>
+    /// The tick is the commit, and this is where the commit happens — in a NORMAL task with a normal toolset, not in
+    /// a Proact one. That is the whole architecture of the thing: Proact prepares an irreversible act and is
+    /// permanently incapable of performing it; the user's single click hands the prepared plan to the assistant that
+    /// does that work when asked. So the rule holds before and after the tick, and permission changes who acts
+    /// rather than what Proact may do.
+    /// </remarks>
+    public Task<string> RunTickedProposalAsync(Session session, ProactAction proposal)
+    {
+        var task = StartTask(session,
+            "The user has just approved this, with one click, from a proposal you put to them. Carry it out now.\n\n" +
+            $"WHAT THEY APPROVED: {proposal.What}\n" +
+            $"THE PLAN THEY APPROVED — follow it, do not improvise a different one:\n{proposal.Plan}\n\n" +
+            (proposal.Catch is { Length: > 0 } risk ? $"What they were told could not be undone: {risk}\n\n" : "") +
+            "They approved THIS, exactly. If you find that it cannot be done as written — the slot has gone, the " +
+            "price has changed, the page wants something nobody mentioned — stop and say so rather than doing the " +
+            "nearest similar thing. A one-click approval is not approval of an alternative.\n" +
+            "Report what happened in one line when you are done.");
+        task.Ticked = true;
+        Trace($"[proact] ticked \"{Snip(proposal.What, 60)}\" -> task {task.Id}");
+        return Task.FromResult(task.Id);
+    }
+
+    public Task<string> BuildWidgetAsync(Session session, Widget widget, string shows)
+    {
+        // The description is what the user asked for, not a brief. Each state writes its own from the record — see
+        // PanelBuildBriefs — so nothing carries twenty-one thousand characters of instruction about Tailwind classes
+        // into the step that is deciding what the panel should show.
+        var task = StartTask(session, $"Build the home-page panel \"{widget.Title}\": {shows}");
+        task.PanelStates = true;
+        task.PanelShows = shows;
+        task.BuildsWidget = widget.Id;
+        _widgets?.Building(widget.Id, task.Id);
+        // The first state's words, not the second's. It used to say "Designing it" from the moment the panel was
+        // reserved, which was a small lie for the first minute and the only thing the user had to read.
+        _widgets?.Reached(widget.Id, PanelStages.Of(PanelStep.Agree));
+        Trace($"[widget] {widget.Id} \"{widget.Title}\" -> task {task.Id}");
+        return Task.FromResult(task.Id);
+    }
+
+    // What's on the user's home page, so the model revises the panel that exists rather than adding a second one
+    // beside it — and so it can see when something it put there has stopped being worth a place.
+    private string WidgetsNote() => _widgets?.Describe() ?? "";
+
+    // The memory's own open questions — two names that might be one person. In the conversation rather than on a
+    // settings page, because that is where the answer turns up: somebody says "Matt's coming too" in a chat about
+    // something else entirely, and that settles it, but only if the question was in front of the model.
+    private string AsksNote() => MemoryTools.Asks(_memory.Graph);
+
+    // And what is already being watched for. Without it, "let me know when they reply" a week later starts a second
+    // job that finds the same feed again and doubles the polling for ever.
+    private string WatchNote() =>
+        _feeds is not null && _watchers is not null ? FeedTools.Note(_feeds, _watchers) : "";
+
+    // And the kinds already in the library, so a request that an existing shape covers becomes a parameter rather
+    // than a build. This is the note that stops the system rebuilding a flight tracker for every flight.
+    private string KindsNote() => _kinds?.Describe() ?? "";
+
+    /// <summary>
+    /// The lists that exist, by name only.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Because a list nobody knows about cannot be read. Asked where to go for dinner with a list of dinner places on
+    /// file, it delegated a web search for restaurants in Soho — perfectly sensible behaviour for something that had
+    /// never been told the list was there, and a worse answer than the one already sitting in front of it.
+    /// </para>
+    /// <para>
+    /// Titles and counts, never items. What is ON a list is a tool call away and belongs in the answer to a question
+    /// about that list; putting every item here would make the shopping the model reads every turn.
+    /// </para>
+    /// </remarks>
+    private string ListsNote()
+    {
+        if (_lists is null) return "";
+
+        var held = _lists.All().Where(l => l.Items.Count > 0).Take(12).ToList();
+        if (held.Count == 0) return "";
+
+        return "\n\nLists already going, readable by id with list_read — check these before going looking " +
+               "elsewhere for something they have already written down:\n" +
+               string.Concat(held.Select(l =>
+                   $"- {l.Title} ({l.Id}) — {l.Items.Count} item(s)" +
+                   (l.Known.Any() ? $", {l.Known.Count()} of them things the brain knows about" : "") + "\n"));
+    }
+
+    // The local folders that have been granted. Listed because a panel showing the user's own photos is only possible
+    // if one exists, and the alternative to saying so is a worker going looking — which is how a build once spent four
+    // minutes port-scanning localhost for a picture server that was never there.
+    private string SourcesNote() => Sources?.Describe() ?? "";
+
+    // What's scheduled for later in THIS thread, surfaced so the model can reference or cancel it (and won't
+    // re-schedule the same thing). Empty when scheduling isn't wired or nothing's pending here.
+    private string ScheduledNote(Session session)
+    {
+        if (_schedules is null) return "";
+        var pending = _schedules.PendingFor(session.Id);
+        if (pending.Count == 0) return "";
+        var sb = new StringBuilder("\n\nScheduled for later in this thread (refer to / cancel by id):\n");
+        foreach (var t in pending)
+            sb.Append($"- #{t.Id} at {t.FireAt.ToLocalTime():ddd d MMM HH:mm}" +
+                      (t.Recurring ? $", repeating {t.Repeat}" : "") +
+                      (t.Runs > 0 ? $" (has run {t.Runs}×)" : "") +
+                      $": {t.TaskText}\n");
+        sb.Append("Use cancel_schedule(id) to drop one. Don't re-schedule something already listed here.\n");
+        return sb.ToString();
+    }
+
+    private static List<TaskInfo> OrderedTasks(Session session) =>
+        session.Tasks.Values.Where(t => t.ParentTaskId is null)
+            .OrderBy(t => int.TryParse(t.Id, out var n) ? n : 0).ToList();
+
+    // Not static any more: a task the session has forgotten is rebuilt from what was recorded about it, so
+    // every tool that takes a task id keeps working across a restart rather than only message_task.
+    private bool TryResolve(Session session, ToolCall call, out TaskInfo task, out string miss)
+    {
+        var id = call.Arguments.GetStringOrNull("id")?.TrimStart('#').Trim();
+        if (!string.IsNullOrEmpty(id) && Recall(session, id!) is { } found)
+        {
+            task = found;
+            miss = "";
+            return true;
+        }
+        task = null!;
+        miss = id is null ? "No task id was provided." : $"There's no task #{id}.";
+        return false;
+    }
+
+    private static string Tail(StringBuilder sb, int max) =>
+        sb.Length <= max ? sb.ToString() : sb.ToString(sb.Length - max, max);
+
+    // What we ask the worker to report once it has finished — and the schema we FORCE that report into.
+    private const string FinalizeInstruction =
+        "You have stopped working on the task above. Report your outcome as JSON.\n" +
+        "- If you completed the task or fully answered it, set status = \"done\" (leave question/options empty).\n" +
+        "- ONLY if you are genuinely blocked and cannot proceed without a decision that just the user can make " +
+        "(a real choice or a missing preference — NEVER to confirm something you could simply do), set " +
+        "status = \"question\": put one clear, specific question in \"question\", and the 2–4 most likely short " +
+        "answers in \"options\" (the user can also type their own).\n" +
+        "- show: the file(s) the USER should receive now — your finished deliverable(s) ONLY, each by its exact " +
+        "name. Leave out scratch and intermediate files (the script you ran, raw data, debug images). Empty if " +
+        "you produced nothing for the user. A file the project already holds counts: if what they asked for " +
+        "exists already, name it and hand it over rather than rebuilding it.\n" +
+        "- keep: any file worth SAVING for future conversations as a reusable asset — a brand kit/playbook, a " +
+        "template — each as {file, scope}. scope is \"brand:<slug>\" for a brand kit (\"house\" = your own brand; " +
+        "a slug that doesn't exist yet starts a NEW brand), \"global\" to share with everyone, or a specialist " +
+        "id. Empty unless something is genuinely worth keeping; ordinary working files are not.\n" +
+        "Decide strictly from the conversation above. Only list files that actually exist — never invent a name, " +
+        "a deliverable, or a reason to ask.";
+
+    // A strict JSON Schema for the worker's outcome. Passed to the model as Ollama's `format`, so the reply
+    // is GUARANTEED to parse and to carry a real status — the question (and the show/keep file disposition) are
+    // structured fields, never guessed from prose.
+    private static JsonNode OutcomeSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["status"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("done", "question") },
+            ["question"] = new JsonObject { ["type"] = "string" },
+            ["options"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+            // What shape of answer it wants, so the user gets the right control instead of a text box for
+            // everything. Structured rather than inferred from the wording of the question.
+            ["answer_kind"] = new JsonObject
+            {
+                ["type"] = "string",
+                ["enum"] = new JsonArray("text", "choice", "number", "place", "confirm"),
+            },
+            ["unit"] = new JsonObject { ["type"] = "string" },        // number: "people", "minutes", "£"
+            ["min"] = new JsonObject { ["type"] = "number" },
+            ["max"] = new JsonObject { ["type"] = "number" },
+            ["suggested"] = new JsonObject { ["type"] = "number" },
+            // place: where to drop the pin. Omitted means "where the user is", which is the common case —
+            // confirming a pickup point.
+            ["latitude"] = new JsonObject { ["type"] = "number" },
+            ["longitude"] = new JsonObject { ["type"] = "number" },
+            ["place_label"] = new JsonObject { ["type"] = "string" },
+            ["show"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+            ["keep"] = new JsonObject
+            {
+                ["type"] = "array",
+                ["items"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["file"] = new JsonObject { ["type"] = "string" },
+                        ["scope"] = new JsonObject { ["type"] = "string" },
+                    },
+                    ["required"] = new JsonArray("file", "scope"),
+                },
+            },
+        },
+        ["required"] = new JsonArray("status"),
+    };
+
+    /// <summary>What a finished leg resolved to: a blocking question (when the worker can't proceed without the
+    /// user), the file(s) to hand the user now (Show), and the file(s) to persist as reusable assets (Keep).
+    /// <paramref name="ShowRequested"/> records whether the finalize NAMED any file to show at all — even ones
+    /// that turned out not to exist on disk (and so were dropped from Show). That lets the caller catch the
+    /// "claimed a deliverable but nothing actually landed" case and re-voice it honestly instead of celebrating a
+    /// file the user never received.</summary>
+    private sealed record LegOutcome(PendingQuestion? Question, IReadOnlyList<string> Show, IReadOnlyList<KeepItem> Keep, bool ShowRequested = false);
+
+    /// <summary>Force the worker's outcome into a structured verdict instead of parsing it out of free text.
+    /// After the worker has finished, one schema-constrained call classifies the run: whether it's blocked on the
+    /// user, which finished file(s) to hand over, and which to keep for next time — the model literally cannot
+    /// return anything but JSON matching <see cref="OutcomeSchema"/>. The caller acts on it (the worker no longer
+    /// has to remember to send/promote mid-run). Best-effort: any failure falls back to a plain finish (no
+    /// question, nothing to show/keep) so a real answer is never swallowed.</summary>
+    private async Task<LegOutcome> FinalizeOutcomeAsync(
+        Session session, TaskInfo task, CancellationToken ct, IReadOnlyList<Message>? conversation = null)
+    {
+        var none = new LegOutcome(null, Array.Empty<string>(), Array.Empty<KeepItem>());
+        try
+        {
+            // A single worker classifies from its own transcript; a PLAN coordinator has none of its own, so the
+            // caller passes a synthetic transcript built from the steps' results instead.
+            var convo = new List<Message>(conversation ?? task.Conversation) { Message.System(FinalizeInstruction) };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false, // just classifying a conclusion it already reasoned to — keep it fast
+                ResponseFormat = OutcomeSchema(),
+                MaxOutputTokens = 512,
+                TurnTimeout = TimeSpan.FromSeconds(40),
+            };
+
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return none;
+
+            string content = response.Content.Trim();
+            int firstBrace = content.IndexOf('{');
+            int lastBrace = content.LastIndexOf('}');
+            if (firstBrace >= 0 && lastBrace > firstBrace)
+            {
+                content = content.Substring(firstBrace, lastBrace - firstBrace + 1);
+            }
+
+            using var doc = JsonDocument.Parse(content);
+            var root = doc.RootElement;
+
+            // Only ever offer real, existing conversation files — a model under a schema will still happily name
+            // a file it never wrote, so anything that isn't on disk is dropped rather than acted on.
+            var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if (ThreadFilesDir(session) is { } filesDir && Directory.Exists(filesDir))
+                foreach (var f in new DirectoryInfo(filesDir).GetFiles()) present.Add(f.Name);
+            var (show, keep) = ParseDeliverables(root, present);
+
+            // Did the finalize NAME any file to show — before we filter to what's actually on disk? If it did but
+            // none survived (the model "delivered" a file it never wrote), we must NOT relay a success message.
+            bool showRequested = root.TryGetProperty("show", out var rawShow) && rawShow.ValueKind == JsonValueKind.Array
+                && rawShow.EnumerateArray().Any(f => f.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(f.GetString()));
+
+            var status = root.TryGetProperty("status", out var s) ? s.GetString() : null;
+            PendingQuestion? question = null;
+            if (string.Equals(status, "question", StringComparison.OrdinalIgnoreCase))
+            {
+                var q = root.TryGetProperty("question", out var qEl) && qEl.ValueKind == JsonValueKind.String
+                    ? qEl.GetString()?.Trim()
+                    : null;
+                if (!string.IsNullOrWhiteSpace(q)) // said "question" but gave none → treat as finished
+                {
+                    var options = new List<string>();
+                    if (root.TryGetProperty("options", out var optEl) && optEl.ValueKind == JsonValueKind.Array)
+                        foreach (var o in optEl.EnumerateArray())
+                            if (o.ValueKind == JsonValueKind.String && o.GetString()?.Trim() is { Length: > 0 } opt)
+                                options.Add(opt);
+                    Trace($"[worker #{task.Id}] finalize -> QUESTION: {Snip(q!, 160)}");
+                    question = new PendingQuestion(q!, options);
+                }
+            }
+
+            if (show.Count > 0 || keep.Count > 0)
+                Trace($"[worker #{task.Id}] finalize -> show=[{string.Join(",", show)}] keep=[{string.Join(",", keep.Select(k => $"{k.File}->{k.Scope}"))}]");
+            return new LegOutcome(question, show, keep, showRequested);
+        }
+        catch (Exception ex)
+        {
+            Trace($"[worker #{task.Id}] finalize failed ({ex.Message}) — treating as finished");
+            return none; // never let finalization swallow a real answer; relay verbatim
+        }
+    }
+
+    /// <summary>One file the worker wants saved beyond the conversation, and where (the promote_file scope:
+    /// "brand:&lt;slug&gt;", "global", or a specialist id).</summary>
+    internal sealed record KeepItem(string File, string Scope);
+
+    /// <summary>Pull the show/keep file disposition out of the finalize JSON, keeping only entries that name a
+    /// file actually present in the conversation (<paramref name="presentFiles"/>) — a schema-constrained model
+    /// will still cheerfully name a file it never wrote, and acting on that would upload or "save" nothing. show
+    /// is de-duped; a keep entry needs both a real file and a non-empty scope. Pure, so it can be tested without
+    /// a model.</summary>
+    internal static (IReadOnlyList<string> Show, IReadOnlyList<KeepItem> Keep) ParseDeliverables(
+        JsonElement root, ISet<string> presentFiles)
+    {
+        var show = new List<string>();
+        if (root.TryGetProperty("show", out var showEl) && showEl.ValueKind == JsonValueKind.Array)
+            foreach (var f in showEl.EnumerateArray())
+                if (f.ValueKind == JsonValueKind.String && SafeName(f.GetString() ?? "") is { Length: > 0 } n
+                    && presentFiles.Contains(n) && !show.Contains(n, StringComparer.OrdinalIgnoreCase))
+                    show.Add(n);
+
+        var keep = new List<KeepItem>();
+        if (root.TryGetProperty("keep", out var keepEl) && keepEl.ValueKind == JsonValueKind.Array)
+            foreach (var k in keepEl.EnumerateArray())
+            {
+                if (k.ValueKind != JsonValueKind.Object) continue;
+                var file = k.TryGetProperty("file", out var fe) && fe.ValueKind == JsonValueKind.String ? SafeName(fe.GetString() ?? "") : "";
+                var scope = k.TryGetProperty("scope", out var se) && se.ValueKind == JsonValueKind.String ? se.GetString()?.Trim() ?? "" : "";
+                if (file.Length > 0 && scope.Length > 0 && presentFiles.Contains(file))
+                    keep.Add(new KeepItem(file, scope));
+            }
+
+        return (show, keep);
+    }
+
+    /// <summary>A phrase reduced to the shape a project slug takes: lowercase, words joined by hyphens.</summary>
+    private static string Slugify(string value)
+    {
+        var chars = value.Trim().ToLowerInvariant()
+            .Select(c => char.IsLetterOrDigit(c) ? c : '-')
+            .ToArray();
+        return string.Join('-', new string(chars).Split('-', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    /// <summary>
+    /// Write down how the job was done, for the next run that has to do it again.
+    ///
+    /// <para>
+    /// Seven eBay listings and five Gmail sends are recorded here, each having worked the procedure out from
+    /// nothing — one listing cost 417 tool calls, one email 617. The transcript knew the answer every time and
+    /// was never asked.
+    /// </para>
+    /// <para>
+    /// The model is given evidence, not the transcript: the steps that actually changed something, and the
+    /// calls that were refused alongside what worked instead. Both are derived mechanically, so the write-up is
+    /// anchored to what happened rather than to what would sound plausible — and a few dozen factual lines cost
+    /// a fraction of four hundred steps.
+    /// </para>
+    /// <para>
+    /// It is asked for the GENERIC shape on purpose. A hint filed under "list a signed vinyl record" helps
+    /// nobody; the same job with a Switch has to find it.
+    /// </para>
+    /// </summary>
+    private async Task LearnHowAsync(TaskInfo task, IReadOnlyList<RunStep> steps)
+    {
+        if (_hints is null || steps.Count == 0)
+        {
+            Trace($"[guides] task {task.Id} not considered (hints={_hints is not null}, steps={steps.Count})");
+            return;
+        }
+
+        try
+        {
+            // A run that only looked at things learned no HOW. Two distinct steps that changed something is the
+            // floor — go here, then do that — and the count is only here to avoid paying for a write-up on a run
+            // that did nothing at all; whether there is a lesson in it is the write-up's own call, which is why
+            // it is told it may return nothing. A floor of three lost "open gov.uk, save the table to a file",
+            // which is exactly the sort of thing worth not working out twice.
+            // Traced, because "nothing was written" and "the learner never ran" look identical from outside.
+            var spine = RunLessons.Spine(steps);
+            if (spine.Count < 2)
+            {
+                Trace($"[guides] task {task.Id} taught nothing: {spine.Count} step(s) changed anything");
+                return;
+            }
+
+            // The guides this run FOLLOWED come through in full, because those are the ones it is in a position
+            // to correct and a rewrite that can't see the old text isn't a revision, it's a replacement: the
+            // bank-holidays guide came back on its second pass leading with Scotland, having quietly dropped
+            // what the England run taught it. The rest are names only — enough to reuse one deliberately,
+            // without paying for the whole library on every run.
+            var known = _hints.All();
+            var followed = task.Guides
+                .Select(n => _hints.Get(n)).Where(g => g is not null).Select(g => g!).ToList();
+            var others = known.Where(g => !followed.Any(f =>
+                string.Equals(f.Name, g.Name, StringComparison.OrdinalIgnoreCase))).ToList();
+
+            var evidence = RunLessons.Evidence(task.Description, steps);
+            var inventory = new StringBuilder();
+            foreach (var g in followed)
+                inventory.Append($"- {g.Name} (THIS RUN FOLLOWED IT — revise it, keeping what still holds):\n" +
+                                 $"  {g.Description}\n");
+            if (others.Count > 0)
+                inventory.Append("- other guides that exist, by name: ")
+                         .Append(string.Join("; ", others.Select(g => g.Name))).Append('\n');
+            if (inventory.Length == 0) inventory.Append("(none yet)\n");
+
+            // Guidance first, evidence last.
+            //
+            // Everything above the tail is byte-identical on every run, so it sits in the provider's prefix
+            // cache and is charged at the cached rate; only the tail changes. Interleaving them puts a volatile
+            // block near the top and makes every token after it uncacheable, so the fixed instructions get paid
+            // for at full price on every single run.
+            var instruction =
+                "Below is a job that has just been done: the guides already written, and what this run actually "
+                + "did — the steps that changed something, and the calls that were refused with what worked "
+                + "instead.\n\n"
+                + "Write the guides that would help a future agent do a job like this quickly. Return every guide "
+                + "you want to exist: reuse an existing NAME to replace and improve that guide, or give a new "
+                + "name to add one. Guides you don't mention are left alone.\n\n"
+                + "- name: the generic job, in a few words — \"list an item on eBay\", \"send an email in Gmail\". "
+                + "Never the specific thing: not this record, not this recipient. The next job has different "
+                + "particulars and must still find it.\n"
+                + $"- description: at most {TaskHintStore.MaxDescriptionLength} characters, and shorter is better. "
+                + "Only what the next run could not work out by looking: where to start, which control is the real "
+                + "one, what to do instead of the obvious thing. Name the tools and what to aim them at.\n\n"
+                + "Write it for a job with DIFFERENT particulars, and split them from the route.\n"
+                + "KEEP the route: the address to start at, the controls to use, the order, the trap. Those are the "
+                + "same next time and they are the whole reason the guide exists — name the page.\n"
+                + "DROP this job's particulars: what it was looking for, what it found, the dates, the amounts, the "
+                + "names, the file it wrote. Say where a value goes, never which value it was. A guide is thrown "
+                + "away for being over length, so spending it on this run's details loses the route as well.\n"
+                + "Prefer lessons about the SITE, which stay true — a dialog that only offers two options, a "
+                + "button that is not the real control. A refusal from our own tooling may already be fixed, so "
+                + "only keep it if the lesson is about the site.\n"
+                + "Record no prices, policies, terms or personal details. Those are decisions for the user to "
+                + "make each time, and a guide that carries one repeats it forever.\n"
+                + "Return an empty list if this run taught nothing worth keeping.\n\n"
+                + "--- guides that already exist ---\n"
+                + inventory
+                + "\n\n--- what this run did ---\n"
+                + evidence;
+
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = new List<Message> { Message.System(instruction) },
+                Think = false,
+                ResponseFormat = GuideSchema(),
+                MaxOutputTokens = 1200,
+                TurnTimeout = TimeSpan.FromSeconds(60),
+            };
+
+            var response = await ((IModelProvider)_provider)
+                .CompleteAsync(request, CancellationToken.None).ConfigureAwait(false);
+
+            // Every way this can come back empty is traced. It runs after the user has their answer, so a
+            // silent one is invisible: the store simply stays empty and nothing ever says why.
+            if (string.IsNullOrWhiteSpace(response.Content))
+            {
+                Trace($"[guides] task {task.Id}: the write-up came back empty");
+                return;
+            }
+
+            var content = response.Content.Trim();
+            int first = content.IndexOf('{'), last = content.LastIndexOf('}');
+            if (first < 0 || last <= first)
+            {
+                Trace($"[guides] task {task.Id}: no JSON in the write-up: {Snip(content, 200)}");
+                return;
+            }
+
+            using var doc = JsonDocument.Parse(content[first..(last + 1)]);
+            if (!doc.RootElement.TryGetProperty("guides", out var guides) ||
+                guides.ValueKind != JsonValueKind.Array)
+            {
+                Trace($"[guides] task {task.Id}: no guides array: {Snip(content, 200)}");
+                return;
+            }
+
+            int written = 0;
+            var refused = new List<string>();
+            foreach (var g in guides.EnumerateArray())
+            {
+                if (g.ValueKind != JsonValueKind.Object) continue;
+                string Read(string name) =>
+                    g.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+                        ? v.GetString() ?? "" : "";
+
+                var gname = Read("name").Trim();
+                var desc = Read("description").Trim();
+                if (gname.Length == 0 || desc.Length == 0) continue;
+
+                if (_hints.Upsert(gname, desc, $"task {task.Id}")) written++;
+                else refused.Add($"{gname} ({desc.Length} chars)");
+            }
+
+            Trace($"[guides] task {task.Id}: {spine.Count} step(s) → " +
+                  $"{guides.GetArrayLength()} offered, {written} written" +
+                  (refused.Count > 0 ? $", too long: {string.Join(", ", refused)}" : ""));
+
+            // A write-up that keeps declining to write anything is either being told the wrong thing or being
+            // shown the wrong thing, and only one of those is visible from the count. Print what it read.
+            if (written == 0) Trace($"[guides] nothing kept from: {Snip(evidence, 800)}");
+        }
+        catch (Exception ex)
+        {
+            // A guide is an optimisation for next time. Never let it disturb the run that just succeeded.
+            Trace($"[guides] not written: {ex.Message}");
+        }
+    }
+
+    private static JsonNode GuideSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["guides"] = new JsonObject
+            {
+                ["type"] = "array",
+                ["items"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["name"] = new JsonObject { ["type"] = "string", ["maxLength"] = 60 },
+                        // Stated here as well as in the prose. Whether the provider enforces it is its business;
+                        // the store refuses an over-long guide either way, and one that says so twice gets
+                        // refused less often.
+                        ["description"] = new JsonObject
+                        {
+                            ["type"] = "string",
+                            ["maxLength"] = TaskHintStore.MaxDescriptionLength,
+                        },
+                    },
+                    ["required"] = new JsonArray { "name", "description" },
+                },
+            },
+        },
+        ["required"] = new JsonArray { "guides" },
+    };
+
+
+
+
+    // A short, human-readable line listing what the user attached, appended to their message so the model
+    // knows files are in play.
+    private static string AttachmentNote(IReadOnlyList<Attachment> attachments)
+    {
+        var sb = new StringBuilder();
+        foreach (var a in attachments)
+        {
+            sb.Append($"\n\n[user uploaded file \"{a.Name}\"{(a.Size > 0 ? $" ({HumanSize(a.Size)})" : "")}]");
+        }
+        return sb.ToString();
+    }
+
+    private string FilesNote(Session session)
+    {
+        if (ThreadFilesDir(session) is not { } filesDir || !Directory.Exists(filesDir)) return "";
+        try
+        {
+            var files = new DirectoryInfo(filesDir).GetFiles().OrderBy(f => f.Name).ToList();
+            if (files.Count == 0) return "";
+            var sb = new StringBuilder("\n\nFiles available in this conversation's files area (the 'pot' of files):\n");
+            foreach (var f in files)
+            {
+                sb.Append($"- {f.Name} ({HumanSize(f.Length)})\n");
+            }
+            sb.Append("These files persist across turns. You can refer to them or delegate tasks using them without asking the user to re-upload.");
+            return sb.ToString();
+        }
+        catch { return ""; }
+    }
+
+    private static string HumanSize(long bytes) => bytes switch
+    {
+        >= 1024 * 1024 => $"{bytes / (1024.0 * 1024.0):0.#} MB",
+        >= 1024 => $"{bytes / 1024.0:0.#} KB",
+        _ => $"{bytes} B",
+    };
+
+    // Materialise a task's working directory: <root>/<session>/<taskId>/ with task.md (the brief) and a
+    // files/ folder holding copies of the turn's attachments. Returns the absolute workspace path, or null
+    // when no workspace root is configured. Best-effort — a copy failure is logged and skipped, never fatal.
+    private static string SafeSession(string? id) =>
+        string.Concat((id ?? "session").Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+
+    // The CONVERSATION's file area: one folder per thread/session holding every file shared into, or produced
+    // in, this conversation. The scoped file tools (write/list/send) are rooted here, so files persist across
+    // the thread's tasks — you can re-send something shared three tasks ago — and never cross between threads.
+    private string? ThreadFilesDir(Session session)
+    {
+        if (string.IsNullOrEmpty(_workspaceRoot)) return null;
+        return Path.Combine(_workspaceRoot, SafeSession(session.Id), "files");
+    }
+
+    /// <summary>The same folder, addressable without an Orchestrator — for serving a thread's files back over HTTP.
+    /// One definition of where a conversation's files live, so the route can't drift from the tools.</summary>
+    public static string FilesDirFor(string workspaceRoot, string sessionId) =>
+        Path.Combine(workspaceRoot, SafeSession(sessionId), "files");
+
+    // File buckets: read-only areas mounted alongside a conversation's own files, so persistent assets live in
+    // ONE managed place instead of being re-uploaded every thread. Two scopes:
+    //  • global  — <root>/_buckets/global         (every worker, every thread)
+    //  • persona — <root>/_buckets/persona/<id>   (only when that persona runs — e.g. the brand kit)
+    // The dirs are created so a human can drop files in; an empty bucket simply contributes nothing.
+    private string? GlobalBucketDir() =>
+        string.IsNullOrEmpty(_workspaceRoot) ? null : Path.Combine(_workspaceRoot, "_buckets", "global");
+
+    private string? PersonaBucketDir(string personaId) =>
+        string.IsNullOrEmpty(_workspaceRoot) ? null
+            : Path.Combine(_workspaceRoot, "_buckets", "persona", SafeSession(personaId));
+
+    // Brand buckets: one named kit per brand this (agency) manages — the house brand plus one per client.
+    // <root>/_buckets/brand/<slug>/ holds that brand's tokens, logo, assets and optional template. The set of
+    // folders IS the registry of brands; creating a brand = promoting an approved tokenset into a new slug.
+    private string? BrandsRootDir() =>
+        string.IsNullOrEmpty(_workspaceRoot) ? null : Path.Combine(_workspaceRoot, "_buckets", "brand");
+
+    // A shared, cross-thread font cache: <root>/_buckets/_fontcache holds TTF/OTF files a worker downloaded in an
+    // earlier run, mounted read-only into every worker so it can reference one by path in run_python instead of
+    // re-downloading the same font for every new brand. run_python harvests downloaded fonts into it (see
+    // DataScienceCapability), so the cache fills itself. Must live OUTSIDE per-thread file areas — it's global.
+    internal static string? FontCacheDirFor(string? workspaceRoot) =>
+        string.IsNullOrEmpty(workspaceRoot) ? null : Path.Combine(workspaceRoot, "_buckets", "_fontcache");
+
+    private string? FontCacheDir() => FontCacheDirFor(_workspaceRoot);
+
+    private string? BrandBucketDir(string slug) =>
+        BrandsRootDir() is { } root ? Path.Combine(root, SafeSession(slug)) : null;
+
+    // Reduce a caller-supplied file reference to a safe bare name under the (flat) conversation file area —
+    // the same flattening write_file/send_file use, so a name is resolved identically everywhere and can't
+    // traverse out of the thread's area.
+    private static string SafeName(string name) =>
+        string.Concat(Path.GetFileName((name ?? "").Trim()).Select(c =>
+            Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+
+    /// <summary>Outcome of saving a conversation file into a durable bucket: whether it worked, a human detail
+    /// line, and — for a brand scope — whether this CREATED a brand and which slug, so the caller can tell the
+    /// user a new kit was started.</summary>
+    private sealed record PromoteOutcome(bool Ok, string Detail, bool IsNewBrand, string? BrandSlug);
+
+    /// <summary>Copy a file from this conversation's area into a durable bucket. scope is "global", a specialist
+    /// id, or "brand:&lt;slug&gt;" (a slug whose folder doesn't exist yet starts a new brand — the folder set IS
+    /// the registry). Shared by the promote_file tool and the end-of-leg deliver pass so both resolve names,
+    /// scopes and brand creation identically.</summary>
+    private PromoteOutcome PromoteThreadFile(Session session, string fileName, string scope)
+    {
+        if (ThreadFilesDir(session) is not { } filesDir)
+            return new(false, "Files aren't available in this context, so there's nothing to save.", false, null);
+        if (string.IsNullOrWhiteSpace(fileName)) return new(false, "Which file? Use the name shown by list_files.", false, null);
+        if (string.IsNullOrWhiteSpace(scope)) return new(false, "Where to? Give a specialist id (e.g. branding_designer) or \"global\".", false, null);
+
+        var safe = SafeName(fileName);
+        var source = Path.Combine(filesDir, safe);
+        if (safe.Length == 0 || !File.Exists(source))
+            return new(false, $"There's no file called \"{fileName}\" in this conversation. Check list_files for the exact name.", false, null);
+
+        string? targetDir; string where; bool isNewBrand = false; string? brandSlug = null;
+        if (string.Equals(scope, "global", StringComparison.OrdinalIgnoreCase))
+        {
+            targetDir = GlobalBucketDir();
+            where = "the shared company files";
+        }
+        else if (scope.StartsWith("brand:", StringComparison.OrdinalIgnoreCase))
+        {
+            // brand:<slug> — save into a brand kit, creating that brand if it's new (e.g. a new client).
+            var slug = scope.Substring("brand:".Length).Trim();
+            if (string.IsNullOrEmpty(slug)) return new(false, "Give a brand slug, e.g. scope \"brand:adidas\" (or \"brand:house\").", false, null);
+            targetDir = BrandBucketDir(slug);
+            isNewBrand = targetDir is { } d && !Directory.Exists(d);
+            brandSlug = slug;
+            where = $"the {slug} brand kit{(isNewBrand ? " (new brand)" : "")}";
+        }
+        else if (scope.StartsWith("project:", StringComparison.OrdinalIgnoreCase)
+                 || _projects.Exists(scope.Trim().ToLowerInvariant()))
+        {
+            // project:<slug> — put it with the project it belongs to.
+            //
+            // This was missing entirely: a file could be saved to a brand kit, to a specialist, or globally, but
+            // NOT to a project — so "put this file in the project" had no route and came back "Unknown scope".
+            // Projects already keep files (the page lists them, they can be deleted); nothing could put one there
+            // except a worker's own end-of-run disposition, which is no use for a file the user just handed over.
+            var slug = scope.StartsWith("project:", StringComparison.OrdinalIgnoreCase)
+                ? scope.Substring("project:".Length).Trim().ToLowerInvariant()
+                : scope.Trim().ToLowerInvariant();
+
+            if (_projects.Get(slug) is not { } project)
+                return new(false,
+                    $"There's no project \"{slug}\". Use list_projects to see them, or create_project if it's new.",
+                    false, null);
+
+            targetDir = ProjectFilesDir(slug);
+            where = $"the \"{project.Title}\" project";
+        }
+        else if (_personas?.Get(scope) is { } persona)
+        {
+            targetDir = PersonaBucketDir(persona.Id);
+            where = $"the {persona.Name} kit";
+        }
+        else
+        {
+            var ids = _personas is null ? "" : string.Join(", ", _personas.All.Select(p => p.Id));
+            return new(false,
+                $"Unknown scope \"{scope}\". Use \"project:<slug>\" to file it under a project, \"global\", " +
+                $"\"brand:<slug>\" (e.g. brand:adidas), or one of: {ids}.", false, null);
+        }
+        if (targetDir is null) return new(false, "Durable storage isn't available in this context.", false, null);
+
+        try
+        {
+            Directory.CreateDirectory(targetDir);
+            File.Copy(source, Path.Combine(targetDir, safe), overwrite: true);
+            return new(true, $"Saved {safe} to {where}", isNewBrand, brandSlug);
+        }
+        catch (Exception ex) { return new(false, $"Couldn't save {safe}: {ex.Message}", false, null); }
+    }
+
+    // Document types a finalize MISS can safely fall back to delivering — the things a user actually wants handed
+    // over. Deliberately excludes charts/images, scripts, fonts and data inputs (usually intermediate/scratch),
+    // so the fallback delivers the playbook/report, not the build script or a chart it rendered along the way.
+    private static readonly HashSet<string> FallbackDeliverableExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".md", ".html", ".htm", ".txt", ".zip" };
+
+    // Rendered artifact types a builder (branding_designer) is expected to actually produce — a real deliverable,
+    // not the markdown/scratch it sometimes stops at.
+    private static readonly HashSet<string> RenderedArtifactExts = new(StringComparer.OrdinalIgnoreCase)
+    { ".pdf", ".png", ".jpg", ".jpeg", ".svg", ".gif" };
+
+    /// <summary>Did this leg actually produce a rendered artifact (a PDF/image), vs just describing one? Used to
+    /// catch a builder that "finished" without building — a file of a rendered type that's new or changed since
+    /// the start-of-leg snapshot.</summary>
+    private bool ProducedRenderedArtifact(Session session, IReadOnlyDictionary<string, DateTime> since)
+    {
+        if (ThreadFilesDir(session) is not { } dir || !Directory.Exists(dir)) return false;
+        foreach (var f in new DirectoryInfo(dir).GetFiles())
+        {
+            if (!RenderedArtifactExts.Contains(f.Extension)) continue;
+            if (!since.TryGetValue(f.Name, out var t0) || f.LastWriteTimeUtc > t0) return true; // new or changed this leg
+        }
+        return false;
+    }
+
+    /// <summary>When the finalize names no file to show, the document(s) this leg produced — so a finalize miss
+    /// still delivers something rather than nothing (now the only safety net, with send_file gone). Restricted to
+    /// known document types, and — when a start-of-leg snapshot is given — to files created or changed this leg.</summary>
+    private IReadOnlyList<string> FallbackDeliverables(Session session, IReadOnlyDictionary<string, DateTime>? since)
+    {
+        if (ThreadFilesDir(session) is not { } dir || !Directory.Exists(dir)) return Array.Empty<string>();
+        var outp = new List<string>();
+        foreach (var f in new DirectoryInfo(dir).GetFiles())
+        {
+            if (!FallbackDeliverableExts.Contains(f.Extension)) continue;
+            if (since is not null && since.TryGetValue(f.Name, out var t0) && f.LastWriteTimeUtc <= t0) continue; // unchanged this leg
+            outp.Add(f.Name);
+        }
+        return outp;
+    }
+
+    /// <summary>Act on a finished leg's deliver verdict: upload the finished file(s) the worker marked for the
+    /// user (de-duped against anything it already sent mid-run via <paramref name="sentFiles"/>), and persist
+    /// anything it marked to keep into its bucket. Returns a short note for the re-voice naming what was saved
+    /// (and flagging a newly-created brand kit), or null if nothing was kept.</summary>
+    private string? ApplyDeliverables(Session session, TaskInfo task, LegOutcome outcome, HashSet<string> sentFiles)
+    {
+        // Pictures already shown are already delivered.
+        //
+        // Nine photographs of a restaurant's food went out as a gallery and then again as nine jpegs to download, from
+        // two paths that each did their job correctly and neither of which knew about the other. Showing a picture IS
+        // handing it over; attaching it as a file afterwards asks the user to receive the same thing twice.
+        //
+        // Only images, and only when pictures were actually shown — a document the job wrote is still a document.
+        var shown = outcome.Show;
+        if (session.ShowedPictures && shown.Any(IsPicture))
+        {
+            var also = shown.Where(IsPicture).ToList();
+            shown = shown.Where(n => !IsPicture(n)).ToList();
+            Trace($"[worker #{task.Id}] {also.Count} image(s) already shown as pictures — not attaching them as files");
+            outcome = outcome with { Show = shown };
+        }
+
+        if (ThreadFilesDir(session) is { } filesDir)
+            foreach (var name in outcome.Show)
+            {
+                var path = Path.Combine(filesDir, name);
+
+                // Named from the project's shelf rather than written here: bring it into the conversation so it
+                // can be handed over and served like anything else this chat produced.
+                if (!File.Exists(path) && ProjectFilesDir(task.Project) is { } fromProject)
+                {
+                    var shelved = Path.Combine(fromProject, Path.GetFileName(name));
+                    if (File.Exists(shelved))
+                    {
+                        try
+                        {
+                            Directory.CreateDirectory(filesDir);
+                            File.Copy(shelved, path, overwrite: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Trace($"[worker #{task.Id}] couldn't bring {name} in from the project: {ex.Message}");
+                        }
+                    }
+                }
+
+                if (!File.Exists(path)) continue;
+                if (!sentFiles.Add(Path.GetFullPath(path))) continue; // already sent this leg — don't double-upload
+                // Held until the answer that announces it has been said, then emitted against THAT message (see
+                // FlushUnannouncedFiles). Pinned to this task's origin message instead, the card appeared under the
+                // "I'm on it" ack — above the message telling the user their file was ready.
+                RootTask(session, task).UnannouncedFiles.Add((path, name));
+                RootTask(session, task).DeliveredFiles.Add(name); // truth for the re-voice
+                Trace($"[worker #{task.Id}] delivered {name}");
+            }
+
+        var saved = new List<string>();
+        var newBrands = new List<string>();
+        foreach (var item in outcome.Keep)
+        {
+            var res = PromoteThreadFile(session, item.File, item.Scope);
+            if (!res.Ok) { Trace($"[worker #{task.Id}] keep skipped ({item.File} -> {item.Scope}): {res.Detail}"); continue; }
+            saved.Add(res.Detail);
+            if (res.IsNewBrand && res.BrandSlug is { } slug) newBrands.Add(slug);
+        }
+        if (saved.Count == 0) return null;
+
+        var note = "\n\nYou also saved for future use: " + string.Join("; ", saved) + ".";
+        if (newBrands.Count > 0)
+            note += $" That started a NEW brand kit ({string.Join(", ", newBrands)}) — mention you've saved it and that they can rename it or tweak it if they'd like.";
+        note += " Mention briefly what was saved; don't mention buckets or internals.";
+        return note;
+    }
+
+    /// <summary>The brands currently managed (the slugs of existing brand buckets). The filesystem is the
+    /// registry — no separate store to drift. "house" is implied even before its folder exists.</summary>
+    private IReadOnlyList<string> BrandSlugs()
+    {
+        var slugs = new List<string> { "house" };
+        if (BrandsRootDir() is { } root && Directory.Exists(root))
+            foreach (var d in Directory.GetDirectories(root))
+            {
+                var name = Path.GetFileName(d);
+                if (!string.IsNullOrEmpty(name) && !slugs.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    slugs.Add(name);
+            }
+        return slugs;
+    }
+
+    /// <summary>Build the tools for ONE persona block. Base blocks (web/read/files/memory/shell) are built here
+    /// from the runtime deps; anything else is treated as a capability FUNCTION and resolved to its connected
+    /// integration's tools. This is what makes a persona a tight, composable bundle instead of an everything-set.</summary>
+    private IEnumerable<AgentTool> BuildBlock(string block, Session session, TaskInfo task, IModelProvider provider)
+    {
+        switch (block.Trim().ToLowerInvariant())
+        {
+            // Web research IS the browser. The fetch-and-extract pair (web_search / get_page_answer) is gone:
+            // it answered from snippets and dead HTML, and on any page that renders its content it returned
+            // nothing — so a worker now reads the live page in a real browser, or admits it couldn't. Resolved
+            // through the "browser" capability function, so whichever MCP browser server is connected provides it.
+            case "web":
+                return Browser(task);
+
+            case "read": // read-only file access
+            {
+                // read_file is back, and windowed.
+                //
+                // It was removed to stop whole files reaching the conversation. That didn't happen — what
+                // happened is the model wrote Python to read the file instead, which puts every byte in the
+                // context with no window, no ceiling and nothing telling it to search rather than slurp. A ban
+                // only works if there's no way round it, and here the way round was worse than the thing banned.
+                // The tool caps each call and points at find_in_file for anything specific; Python does neither.
+                var list = new List<AgentTool>
+                {
+                    FileTools.ReadFileTool(rootDir: ThreadFilesDir(session)),
+                    FileTools.SummaryTool(provider, _model, rootDir: ThreadFilesDir(session)),
+                };
+                if (ThreadFilesDir(session) is { } d)
+                {
+                    Directory.CreateDirectory(d);
+                    list.Add(FileTools.FindInFileTool(d));
+                    list.Add(FileTools.ListFilesTool(d, BucketMounts(task)));
+                }
+                return list;
+            }
+
+            case "files": // read + author/revise files in this conversation
+            {
+                var list = new List<AgentTool> { FileTools.SummaryTool(provider, _model, rootDir: ThreadFilesDir(session)) };
+                if (ThreadFilesDir(session) is { } d)
+                {
+                    Directory.CreateDirectory(d);
+                    list.Add(FileTools.WriteFileTool(d));
+                    list.Add(FileTools.EditFileTool(d));
+                    list.Add(FileTools.FindInFileTool(d));
+                    list.Add(FileTools.ListFilesTool(d, BucketMounts(task)));
+                    // Lives with the file tools because a deck IS a file it authors — same directory, so finalize
+                    // and the delivery fallback pick it up without knowing presentations exist.
+                    list.Add(Presentations.BuildTool(d, Images));
+                    list.Add(Downloads.Tool(d));
+                    if (MediaDir is { Length: > 0 } vmd) list.Add(Vision.Tool(vmd, d));
+                }
+                return list;
+            }
+
+            // Recall only. A worker may ASK what is known — that is how it avoids asking the user something they have
+            // already said — but it may not write, for the reason set out where the project tools are added.
+            case "memory":
+                return new[] { MemoryTools.Search(_memory, () => task.Room.Room.Key) };
+
+            case "shell":
+                return new[] { ShellTool.Create() };
+
+            default: // a capability function (project_management, data, images, …) → the connected integration
+                return _capabilities?.BuildFor(new[] { block }, _integrationConfig, task) ?? (IReadOnlyList<AgentTool>)Array.Empty<AgentTool>();
+        }
+    }
+
+    /// <summary>
+    /// Report what a task cost, per model, as an event — so it lands on the run in the control centre and
+    /// survives a restart with it. Costed here rather than in the UI because the price table lives with the
+    /// providers, and a model we have no price for is reported as unpriced instead of as free.
+    /// </summary>
+    private void EmitSpend(Session session, TaskInfo task)
+    {
+        if (!task.Spend.Any) return;
+        var models = task.Spend.Snapshot().Select(u => new
+        {
+            model = u.Model,
+            calls = u.Calls,
+            input = u.InputTokens,
+            cachedInput = u.CachedInputTokens,
+            output = u.OutputTokens,
+            reasoning = u.ReasoningTokens,
+            cost = ModelPrices.CostOf(u),
+            priceKnown = ModelPrices.For(u.Model) is not null,
+        }).ToList();
+
+        Trace($"[worker #{task.Id}] spend: " + string.Join(", ", models.Select(m =>
+            $"{m.model} {m.input}+{m.output}tok" + (m.cachedInput > 0 ? $" ({m.cachedInput} cached)" : "") +
+            (m.priceKnown ? $" ${m.cost:F4}" : " (unpriced)"))));
+
+        session.Append("spend", Json(new { id = task.Id, models }));
+    }
+
+    /// <summary>What a room may recall about one project, newest first — the project's subgraph, audience-filtered
+    /// like every other read.</summary>
+    /// <summary>
+    /// Everything already available about a task, for deciding whether anything actually needs asking.
+    /// <para>
+    /// The gate used to see the brief and a keyword search of memory — nothing else. So it couldn't tell a gap
+    /// from something it already had: it would ask how many people are eating when that's recorded on the
+    /// project, or fail to ask because a matched fact looked adjacent. Everything the worker will have when it
+    /// starts belongs here — the project it's in and what's known about it, the lists it keeps, the files in the
+    /// conversation — so "do I need to ask?" is answered against what's really there.
+    /// </para>
+    /// </summary>
+    private string KnownBeforeStarting(Session session, TaskInfo task)
+    {
+        // Counts, not names — the same leak as the conversation's own note. A worker can search the memory itself, so the
+        // only thing it needs handed to it is the fact that there is one worth searching.
+        var sb = new StringBuilder(_memory.Shape(task.Room.Room.Key) is { Length: > 0 } shape
+            ? $"There is a memory of this person's world holding {shape}. Search it with search_memory before asking " +
+              "them for anything that might already be in it.\n"
+            : "");
+
+        var slug = task.Project ?? session.PinnedProject ?? session.CurrentProject;
+        if (!string.IsNullOrWhiteSpace(slug) && _projects.Get(slug) is { } project)
+        {
+            sb.Append($"\n\nThis is part of the project \"{project.Title}\"");
+            if (!string.IsNullOrWhiteSpace(project.Description)) sb.Append($" — {project.Description}");
+            if (project.WindowNote(DateOnly.FromDateTime(DateTime.Now.Date)) is { Length: > 0 } window)
+                sb.Append($" ({window})");
+            sb.Append('.');
+
+            if (ProjectEdges(slug!, session.Room).Count is > 0 and var known)
+                sb.Append($"\n{known} thing(s) are recorded about it — search_memory before asking for any of them.");
+
+            // Lists are where standing preferences live — the shortlist, the must-haves, the things to avoid.
+            // Exactly the material a clarifying question would otherwise ask for.
+            if (_lists?.Describe(slug) is { Length: > 0 } lists) sb.Append('\n').Append(lists);
+        }
+
+        if (FilesNote(session) is { Length: > 0 } files) sb.Append('\n').Append(files);
+
+        return sb.ToString().Trim();
+    }
+
+    /// <summary>
+    /// What is recorded about one project.
+    /// </summary>
+    /// <remarks>
+    /// Read straight off the graph with no model in the way, because the subject is not in doubt — it is this project.
+    /// Resolution only needs judgement when something has to be found from a sentence; here it is already named.
+    /// </remarks>
+    private IReadOnlyList<ProjectFact> ProjectEdges(string slug, BrainContext room)
+    {
+        var project = _projects.Get(slug);
+        var node = _memory.Graph.Resolve(project?.Title ?? slug).Node ?? _memory.Graph.Get(slug);
+        if (node is null) return Array.Empty<ProjectFact>();
+
+        // Room-scoped, like every other read. A project's state is not exempt from the boundary just because the
+        // subject was named rather than worked out.
+        var seen = _memory.Sees is { } rule ? edge => rule(edge.Audience, room.Room.Key) : (Func<Smarty.Brain.Edge, bool>?)null;
+
+        var facts = _memory.Graph.Properties(node.Id, seen)
+            .Select(e => new ProjectFact(e.Label, e.Value, e.Note))
+            .ToList();
+
+        facts.AddRange(_memory.Graph.Around(node.Id, visible: seen)
+            .Select(step => new ProjectFact(step.Edge.Label, step.To.Name, step.Edge.Note)));
+
+        return facts;
+    }
+
+    /// <summary>The connected browser's tools. Empty when no MCP server claims the <c>browser</c> function — in
+    /// which case a worker has no way to reach the web at all, which the host warns about at startup.</summary>
+    private IReadOnlyList<AgentTool> Browser(TaskInfo task) =>
+        _capabilities?.BuildFor(new[] { "browser" }, _integrationConfig, task) ?? Array.Empty<AgentTool>();
+
+    /// <summary>The read-only buckets a given task's worker can see: the global area always, plus a persona kit.
+    /// For the branding designer the "kit" is the resolved BRAND bucket (house or a client), so it designs in the
+    /// right brand. Dirs are ensured so they're discoverable; empty ones list nothing.</summary>
+    /// <summary>The same folder, addressable without an Orchestrator — for serving or tidying a project's shelf.
+    /// One definition of where those files live, so a route can't drift from the code that writes them.</summary>
+    public static string ProjectFilesDirFor(string workspaceRoot, string project) =>
+        Path.Combine(workspaceRoot, "_projects", SafeSession(project));
+
+    /// <summary>Where a project keeps the files its runs have produced. Null when there's no project or nowhere
+    /// to put them.</summary>
+    private string? ProjectFilesDir(string? project) =>
+        string.IsNullOrEmpty(_workspaceRoot) || string.IsNullOrWhiteSpace(project)
+            ? null
+            : Path.Combine(_workspaceRoot, "_projects", SafeSession(project));
+
+    /// <summary>
+    /// Keep a copy of what a run delivered with its project, so later conversations can read it.
+    /// <para>
+    /// A copy rather than a move: the conversation that made the file still refers to it by name, and the chat
+    /// serves it from there. Newest wins if a project produces the same name twice — a second draft of a deck is
+    /// the deck.
+    /// </para>
+    /// </summary>
+    private void KeepForProject(Session session, TaskInfo task, IReadOnlyList<string> files)
+    {
+        if (files.Count == 0 || ProjectFilesDir(task.Project) is not { } dest) return;
+        if (ThreadFilesDir(session) is not { } source) return;
+
+        try
+        {
+            Directory.CreateDirectory(dest);
+            foreach (var name in files)
+            {
+                var from = Path.Combine(source, Path.GetFileName(name));
+                if (!File.Exists(from)) continue;
+                File.Copy(from, Path.Combine(dest, Path.GetFileName(name)), overwrite: true);
+            }
+            Trace($"[worker #{task.Id}] kept {files.Count} file(s) with project {task.Project}");
+        }
+        catch (Exception ex)
+        {
+            Trace($"[worker #{task.Id}] couldn't keep files with the project: {ex.Message}");
+        }
+    }
+
+    private IReadOnlyList<FileTools.FileMount> BucketMounts(TaskInfo task)
+    {
+        var mounts = new List<FileTools.FileMount>();
+
+        // Everything this project has already produced.
+        //
+        // Files belong to a conversation, so a new chat about the same holiday could not see the playbook the last
+        // one wrote: list_files said "none yet", the file was on disk under another session id, and the worker had
+        // to stop and ask where it was. A project outlives its conversations, so its work should too.
+        if (ProjectFilesDir(task.Project) is { } proj)
+        {
+            try { Directory.CreateDirectory(proj); } catch { /* best-effort */ }
+            mounts.Add(new FileTools.FileMount($"Files from the \"{task.Project}\" project", proj));
+        }
+
+        if (GlobalBucketDir() is { } g)
+        {
+            try { Directory.CreateDirectory(g); } catch { /* best-effort */ }
+            mounts.Add(new FileTools.FileMount("Shared company files", g));
+        }
+
+        if (task.Persona == "branding_designer")
+        {
+            var slug = string.IsNullOrWhiteSpace(task.Brand) ? "house" : task.Brand!;
+            if (BrandBucketDir(slug) is { } bdir)
+            {
+                try { Directory.CreateDirectory(bdir); } catch { /* best-effort */ }
+                var label = string.Equals(slug, "house", StringComparison.OrdinalIgnoreCase)
+                    ? "House brand kit" : $"{slug} brand kit";
+                mounts.Add(new FileTools.FileMount(label, bdir));
+            }
+        }
+        else if (task.Persona is { Length: > 0 } pid && PersonaBucketDir(pid) is { } pdir)
+        {
+            try { Directory.CreateDirectory(pdir); } catch { /* best-effort */ }
+            var label = _personas?.Get(pid)?.Name is { Length: > 0 } n ? $"{n} kit" : $"{pid} kit";
+            mounts.Add(new FileTools.FileMount(label, pdir));
+        }
+
+        // Shared font cache — only worth surfacing once it actually holds something, so an empty cache doesn't
+        // clutter list_files. Once a run downloads a font (harvested by run_python) it shows up here for reuse.
+        if (FontCacheDir() is { } fc && Directory.Exists(fc) && new DirectoryInfo(fc).EnumerateFiles().Any())
+            mounts.Add(new FileTools.FileMount("Cached fonts (reuse instead of re-downloading)", fc));
+
+        return mounts;
+    }
+
+    private string? CreateWorkspace(Session session, TaskInfo task, IReadOnlyList<Attachment>? attachments)
+    {
+        if (string.IsNullOrEmpty(_workspaceRoot)) return null;
+        try
+        {
+            string dir = Path.Combine(_workspaceRoot, SafeSession(session.Id), task.Id);
+            Directory.CreateDirectory(dir);
+
+            var brief = new StringBuilder($"# Task\n\n{task.Description}\n");
+            // Attachments go to the CONVERSATION's file area (shared across the thread's tasks), not under this
+            // one task — so a later task (or a scheduled one) can read or re-send them.
+            if (attachments is { Count: > 0 } && ThreadFilesDir(session) is { } filesDir)
+            {
+                var copied = CopyAttachments(filesDir, attachments);
+                if (copied.Count > 0)
+                {
+                    brief.Append("\n## Files provided (in this conversation's files area)\n\n");
+                    foreach (var name in copied) brief.Append($"- {name}\n");
+                }
+            }
+            File.WriteAllText(Path.Combine(dir, "task.md"), brief.ToString());
+            Trace($"[workspace] #{task.Id} -> {dir}");
+            return dir;
+        }
+        catch (Exception ex)
+        {
+            Trace($"[workspace] #{task.Id} failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    // Copy attachments into a files/ directory, returning the (sanitised) file names actually copied.
+    // Best-effort per file — a copy that fails is logged and skipped, not fatal.
+    private List<string> CopyAttachments(string filesDir, IReadOnlyList<Attachment> attachments)
+    {
+        var copied = new List<string>();
+        Directory.CreateDirectory(filesDir);
+        foreach (var a in attachments)
+        {
+            string safeName = string.Concat(a.Name.Select(c =>
+                Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+            try
+            {
+                var destination = Path.Combine(filesDir, safeName);
+
+                // A file uploaded from the web app is written straight into this directory, so source and
+                // destination are the same file — and File.Copy onto itself fails with "being used by another
+                // process", which reads like a locking problem rather than the no-op it actually is.
+                var alreadyHere = string.Equals(
+                    Path.GetFullPath(a.LocalPath), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase);
+
+                if (!alreadyHere) File.Copy(a.LocalPath, destination, overwrite: true);
+                copied.Add(safeName);
+            }
+            catch (Exception ex) { Trace($"[workspace] copy {a.Name} failed: {ex.Message}"); }
+        }
+        return copied;
+    }
+
+    private string Json(object value) => JsonSerializer.Serialize(value, _json);
+
+    // Emit a complete message (start + one content block + end) — used to echo the user's turn.
+    /// <summary>
+    /// The projects already on the go, riding the message the model is answering.
+    /// <para>
+    /// It cannot decide to look up something it has no idea exists: asked about a holiday with a "Holiday with my
+    /// wife" project sitting in the store, it researched holidays from scratch, because find_project is a tool it
+    /// has to guess it needs. Making it look every turn would buy a round-trip on every message; a handful of
+    /// titles it can simply recognise costs nothing and removes the guess. Attached to the message rather than the
+    /// system prompt so the cacheable prefix stays put when a project is created mid-conversation.
+    /// </para>
+    /// <para>
+    /// Titles only, and no instruction about what to do with them. What the message actually is — this project,
+    /// a second holiday, or an idle question — is a judgement the model is in a better position to make than a
+    /// rule written here, and it already holds project_summary and delegate for when the answer is "this one".
+    /// </para>
+    /// </summary>
+    private string ActiveProjectsNote()
+    {
+        const int shown = 8;
+        var active = _projects.ActiveProjects();
+        if (active.Count == 0) return "";
+
+        // Each one's window travels with it. Without this the model sees "meal prep" and has no way to know the
+        // week it was for has already gone by.
+        var today = DateOnly.FromDateTime(DateTime.Now.Date);
+        var titles = active.Take(shown).Select(p =>
+        {
+            var window = _projects.Get(p.Slug)?.WindowNote(today) ?? "";
+            return window.Length > 0
+                ? $"\"{p.Title}\" ({p.Slug}, {window})"
+                : $"\"{p.Title}\" ({p.Slug})";
+        });
+        var more = active.Count > shown ? $", and {active.Count - shown} more" : "";
+        // Any lists those projects keep, with their ids. A list nobody can see is a list nobody updates — and
+        // updating one needs its id, so the id travels with it rather than requiring a lookup first.
+        var lists = _lists is null
+            ? ""
+            : string.Concat(active.Take(shown)
+                .Select(p => _lists.Describe(p.Slug))
+                .Where(d => d.Length > 0)
+                .Select(d => "\n" + d));
+
+        return $"\n\n[On the go: {string.Join("; ", titles)}{more}.{lists}]";
+    }
+
+    private void EmitMessage(Session session, string role, string text)
+    {
+        int id = session.NextMessageId();
+        session.Append("msg_start", Json(new { id, role }));
+        session.Append("content", Json(new { id, text }));
+        session.Append("msg_end", Json(new { id, text }));
+        ShowWaitingPictures(session, id);
+        EnrichLinks(session, id, text);
+    }
+
+    /// <summary>
+    /// Look up what the links in a finished message are about, and emit them as cards against that message.
+    /// <para>
+    /// Deliberately off the hot path: this is several HTTP round-trips to other people's servers, and the reply is
+    /// already said. The cards arrive when they arrive, the message never waits, and a lookup that fails changes
+    /// nothing — the links are still there in the text.
+    /// </para>
+    /// </summary>
+    private void EnrichLinks(Session session, int msgId, string text)
+    {
+        if (Links is null || string.IsNullOrEmpty(text) || !text.Contains("http", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var cards = await Links.ForMessageAsync(text, CancellationToken.None).ConfigureAwait(false);
+                if (cards.Count == 0) return;
+
+                session.Append("links", Json(new
+                {
+                    id = msgId,
+                    links = cards.Select(c => new { url = c.Url, title = c.Title, image = c.Image, site = c.Site }),
+                }));
+            }
+            catch (Exception)
+            {
+                // A card is a nicety; never let one disturb the conversation.
+            }
+        });
+    }
+
+    /// <summary>
+    /// Publish a picture a job already has on disk, and return the address it can be shown from.
+    /// </summary>
+    /// <remarks>
+    /// Looked for where a job actually puts things — its own thread area first, then the project's shelf — and copied
+    /// into the media folder rather than served from where it lies, so one route serves every image and no path outside
+    /// that folder is ever reachable from a url. A name that escapes its directory resolves to nothing.
+    /// </remarks>
+    private string? Served(Session session, string? project, string name)
+    {
+        if (MediaDir is not { Length: > 0 } media) return null;
+
+        var bare = Path.GetFileName(name.Trim());
+        if (bare.Length == 0) return null;
+
+        var ext = Path.GetExtension(bare).ToLowerInvariant();
+        if (ext is not (".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".avif")) return null;
+
+        foreach (var dir in new[] { ThreadFilesDir(session), ProjectFilesDir(project) })
+        {
+            if (dir is not { Length: > 0 }) continue;
+
+            var from = Path.Combine(dir, bare);
+            if (!File.Exists(from)) continue;
+
+            try
+            {
+                Directory.CreateDirectory(media);
+                var served = $"{Guid.NewGuid():N}{ext}";
+                File.Copy(from, Path.Combine(media, served), overwrite: false);
+                return $"/api/media/{served}";
+            }
+            catch (Exception ex)
+            {
+                Trace($"[gallery] couldn't publish {bare}: {ex.Message}");
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Show a set of pictures in the conversation, against the message being written.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Emitted on the same channel a link preview uses, so it needs no rendering of its own — the client already draws a
+    /// row of image cards, and the only thing it was missing was a caption line that says what the picture is rather
+    /// than which site it came from.
+    /// </para>
+    /// <para>
+    /// Every image is copied locally first, and one that cannot be copied is dropped rather than shown broken. The count
+    /// goes back to the caller so it knows whether to go and find better urls — silently showing four of twelve is how a
+    /// job reports success over a mostly empty answer.
+    /// </para>
+    /// </remarks>
+    private async Task<GalleryResult> ShowPicturesAsync(Session session, string? project, int msgId,
+        IReadOnlyList<GalleryTool.Picture> pictures, CancellationToken ct)
+    {
+        if (Links is null) return new GalleryResult(0, pictures.Count, "there is nowhere to keep a copy of them.");
+
+        var cards = new List<object>();
+        var dropped = 0;
+
+        foreach (var picture in pictures)
+        {
+            // Copy it if we can, and point straight at it if we can't.
+            //
+            // Copying is worth trying first: a hotlinked image stops loading the day the far site decides it should,
+            // and by then nobody can work out why an old answer has a hole in it. But a failed copy is no reason to
+            // drop a picture, and that was the mistake. The sites holding photographs of food refuse a SERVER — no
+            // cookies, a foreign referer, bot checks — while serving the same image perfectly to a real browser. The
+            // chat IS a real browser, so the img can go to the source directly. Nothing had to be downloaded at all.
+            string? shown = picture.Url.StartsWith('/') ? picture.Url : null;
+
+            // A file it already has. The commonest case once a job has done any real work, and the one this tool
+            // refused for a whole run: nine photographs sat in the workspace while the model reported it "needs http
+            // URLs and these are local files". It had the pictures and no way to hand them over.
+            shown ??= Served(session, project, picture.Url);
+
+            if (shown is null)
+            {
+                try { shown = await Links.CopyAsync(picture.Url, ct).ConfigureAwait(false); }
+                catch (Exception) { /* one bad url must not lose the rest */ }
+
+                // Nothing kept, so hand over the original. Only an absolute http(s) url is any use to the browser.
+                shown ??= Uri.TryCreate(picture.Url, UriKind.Absolute, out var direct)
+                          && direct.Scheme is "http" or "https"
+                    ? picture.Url
+                    : null;
+            }
+
+            if (shown is not { Length: > 0 })
+            {
+                dropped++;
+                continue;
+            }
+
+            cards.Add(new
+            {
+                url = picture.Url,
+                title = picture.Title,
+                subtitle = picture.Subtitle,
+                image = shown,
+                site = (string?)null,
+            });
+        }
+
+        if (cards.Count == 0) return new GalleryResult(0, dropped);
+
+        // Queued, not shown. The message being written while a task runs is the one that announced it, so emitting here
+        // puts the pictures above the words that explain them.
+        lock (session.WaitingPictures)
+        {
+            session.WaitingPictures.AddRange(cards);
+            session.ShowedPictures = true;
+        }
+
+        Trace($"[gallery] holding {cards.Count} picture(s) for the next message" +
+              (dropped > 0 ? $", dropped {dropped}" : ""));
+        return new GalleryResult(cards.Count, dropped);
+    }
+
+    // The orchestrator's tools. Schemas only — calls are read off the response and handled against the
+    // session's task registry in HandleToolCall, so the executor bodies are inert.
+    private static readonly AgentTool[] OrchestratorTools =
+    {
+        new("delegate",
+            "Hand a task to a capable background worker that has real tools (shell, internet, files). Provide " +
+            "a clear, self-contained description of the work — the work is automatically routed to the right " +
+            "specialist, and a job that spans several disciplines is planned and run as a sequence of them, so " +
+            "you do NOT need to pick a specialist. Optionally tag it to a project (by slug) so the worker has " +
+            "that project's context. Only set `persona` when the user explicitly names a role to use.",
+            new[]
+            {
+                ToolParameter.String("task", "A clear, self-contained description of the work to do.", required: true),
+                ToolParameter.String("project", "Optional project slug to run the task within.", required: false),
+                ToolParameter.String(
+                    "persona",
+                    "A specialist to hand this to (e.g. designer, software_engineer, data_scientist). Name one " +
+                    "whenever the task obviously belongs to a specialist, not only when the user asks for one — in " +
+                    "particular, anything the user will LOOK at rather than read (a presentation, a deck, a visual " +
+                    "comparison, something to show someone) goes to \"designer\". Blank gets a capable generalist, " +
+                    "which is right for research and wrong for anything whose point is how it looks.",
+                    required: false),
+            },
+            NoOp),
+        new("find_project",
+            "Work out which existing project a statement refers to when it isn't named (\"the flights next " +
+            "week\", \"book the table\"). Searches the projects' titles AND the facts recorded inside them, so " +
+            "a passing detail resolves to the right one. If nothing matches, it tells you to ask the user — it " +
+            "never invents a project. Pass the user's words.",
+            new[] { ToolParameter.String("statement", "The user's statement to resolve to a project.", required: true) },
+            NoOp),
+        new("project_summary",
+            "Get a project's up-to-date summary — what's been decided/booked and what work has run — so you " +
+            "can tell the user how it's going, what's left, or where things stand. Pass the project slug (or " +
+            "leave blank if one's already in focus). If unsure which project, resolve it with find_project first.",
+            new[] { ToolParameter.String("project", "Project slug (optional if one is already in focus).", required: false) },
+            NoOp),
+        new("project_runs",
+            "List the work that has already run on a project: each run's id, label, status and when it finished. " +
+            "Labels only — not what happened inside. A project can hold answers that were never written into its " +
+            "summary. Pass the project slug (or leave blank if one's already in focus).",
+            new[] { ToolParameter.String("project", "Project slug (optional if one is already in focus).", required: false) },
+            NoOp),
+        new("run_result",
+            "Read what one past run produced — the write-up it finished with. Takes a run id from project_runs.",
+            new[] { ToolParameter.String("id", "The run id, as listed by project_runs.", required: true) },
+            NoOp),
+        new("list_tasks",
+            "List the background tasks that have been started and their current status.",
+            Array.Empty<ToolParameter>(),
+            NoOp),
+        new("task_status",
+            "Get the status and latest progress of one background task by its id.",
+            new[] { ToolParameter.String("id", "The id of the task to check.", required: true) },
+            NoOp),
+        new("cancel_task",
+            "Stop a running background task by its id.",
+            new[] { ToolParameter.String("id", "The id of the task to cancel.", required: true) },
+            NoOp),
+        new("message_task",
+            "Send a follow-up to a background task by its id — to steer one that's running, answer one that's " +
+            "waiting on a question, or RE-OPEN a finished (done/failed) one to refine, extend, or retry it. A " +
+            "reopened task resumes from its own saved context (data, files, code it already produced) and just " +
+            "adjusts, so prefer this over delegating a fresh task when the user iterates on a prior result.",
+            new[]
+            {
+                ToolParameter.String("id", "The id of the running task to message.", required: true),
+                ToolParameter.String("message", "The follow-up to pass along to the task.", required: true),
+            },
+            NoOp),
+        new("promote_file",
+            "Save a file from THIS conversation somewhere durable, so it outlives this chat (it otherwise lives " +
+            "only here). This is what to use when the user says to put a file IN a project, or to keep something " +
+            "as a reusable asset. scope is one of: \"project:<slug>\" — file it under that project, where it " +
+            "shows on the project's page alongside its other files (the common case: a document they've just " +
+            "given you that belongs to something ongoing); \"brand:<slug>\" — a brand kit (the client's slug, or " +
+            "\"house\" for your own; a NEW slug creates that brand, which is how an approved branding set becomes " +
+            "a stored brand); \"global\" — shared with everyone; or a specialist id. Ordinary working files stay " +
+            "in the conversation; promote on a clear request to keep or file something.",
+            new[]
+            {
+                ToolParameter.String("name", "Name of the file in this conversation to save, as shown by list_files.", required: true),
+                ToolParameter.String("scope", "Where to save it: \"project:<slug>\" (e.g. project:holiday-with-my-wife), \"brand:<slug>\", \"global\", or a specialist id.", required: true),
+            },
+            NoOp),
+        new("schedule_task",
+            "Schedule something to happen LATER in THIS conversation — a reminder or an action at a future " +
+            "time (\"remind me at 4pm\", \"send me the ticket 5 minutes before my 14:32 train\", \"check back " +
+            "next week and note the decision\"), or something that comes back on a rhythm (\"every morning tell " +
+            "me what's on\", \"check the overnight orders every weekday at 07:30\"). At that time you'll " +
+            "proactively act in this same thread. Give `when` as an absolute LOCAL time in ISO form (e.g. " +
+            "2026-06-26T14:27) — do any \"X before/after\" arithmetic yourself — or a relative \"in N " +
+            "minutes/hours/days\". For something recurring, set `repeat` as well; `when` is then the FIRST time " +
+            "it runs, and if you omit it the first run is worked out from the repeat. `task` is exactly what to " +
+            "do then, written so it stands on its own; the live thread context is also available when it runs.",
+            new[]
+            {
+                ToolParameter.String("when", "Absolute ISO local time (2026-06-26T14:27) or relative (\"in 25m\", \"in 2 hours\", \"in 3 days\"). Optional when `repeat` is given.", required: false),
+                ToolParameter.String("task", "What to do at that time, self-contained.", required: true),
+                ToolParameter.String("repeat", "How often it comes back, for a recurring task: \"daily at 08:00\", \"every weekday at 07:30\", \"weekly on monday at 09:00\", \"every 2 hours\", \"hourly\". Omit for a one-off.", required: false),
+            },
+            NoOp),
+        new("cancel_schedule",
+            "Cancel a previously scheduled item by its id (as shown in the scheduled-for-later list).",
+            new[] { ToolParameter.String("id", "The id of the scheduled item to cancel.", required: true) },
+            NoOp),
+    };
+
+    private static Task<ToolOutput> NoOp(ToolCallArguments _, CancellationToken __) =>
+        Task.FromResult(ToolOutput.Ok("ok"));
+
+    private static bool TryExtractXmlToolCalls(string content, Dictionary<string, AgentTool> availableTools, out List<ToolCall> calls, out string cleaned)
+    {
+        calls = new List<ToolCall>();
+        cleaned = content;
+        
+        if (string.IsNullOrWhiteSpace(content) || !content.Contains("<tool_call>"))
+            return false;
+
+        var removals = new List<(int start, int length)>();
+        int index = 0;
+        int searchStart = 0;
+        while (true)
+        {
+            int startIdx = content.IndexOf("<tool_call>", searchStart);
+            if (startIdx < 0) break;
+            
+            int endIdx = content.IndexOf("</tool_call>", startIdx);
+            if (endIdx < 0)
+            {
+                endIdx = content.Length;
+            }
+            else
+            {
+                endIdx += "</tool_call>".Length;
+            }
+
+            int innerStart = startIdx + "<tool_call>".Length;
+            int innerLength = (endIdx == content.Length) ? (content.Length - innerStart) : (endIdx - "</tool_call>".Length - innerStart);
+            if (innerLength < 0) innerLength = 0;
+            string inner = content.Substring(innerStart, innerLength).Trim();
+            
+            if (TryParseXmlToolCall(inner, availableTools, index++, out var toolCall))
+            {
+                calls.Add(toolCall);
+                removals.Add((startIdx, endIdx - startIdx));
+            }
+            
+            searchStart = endIdx;
+            if (searchStart >= content.Length) break;
+        }
+
+        if (calls.Count == 0)
+            return false;
+
+        foreach (var (start, length) in removals.OrderByDescending(r => r.start))
+        {
+            cleaned = cleaned.Remove(start, length);
+        }
+        
+        cleaned = Regex.Replace(cleaned, @"```[a-zA-Z]*\s*```", "").Trim();
+        return true;
+    }
+
+    private static bool TryParseXmlToolCall(string inner, Dictionary<string, AgentTool> availableTools, int index, out ToolCall toolCall)
+    {
+        toolCall = default;
+        
+        int firstBracket = inner.IndexOf('<');
+        string toolName = firstBracket >= 0 ? inner.Substring(0, firstBracket).Trim() : inner.Trim();
+        
+        if (string.IsNullOrEmpty(toolName) || !availableTools.ContainsKey(toolName))
+            return false;
+
+        var argsObj = new JsonObject();
+        int pos = firstBracket;
+        while (pos >= 0 && pos < inner.Length)
+        {
+            int keyStart = inner.IndexOf("<arg_key>", pos);
+            if (keyStart < 0) break;
+            
+            int keyEnd = inner.IndexOf("</arg_key>", keyStart);
+            string keyName;
+            string valStr = "";
+            int nextPos = -1;
+
+            if (keyEnd >= 0)
+            {
+                keyName = inner.Substring(keyStart + "<arg_key>".Length, keyEnd - (keyStart + "<arg_key>".Length)).Trim();
+                
+                int valStart = inner.IndexOf("<arg_value>", keyEnd);
+                if (valStart >= 0)
+                {
+                    int valEnd = inner.IndexOf("</arg_value>", valStart);
+                    if (valEnd >= 0)
+                    {
+                        valStr = inner.Substring(valStart + "<arg_value>".Length, valEnd - (valStart + "<arg_value>".Length));
+                        nextPos = valEnd + "</arg_value>".Length;
+                    }
+                    else
+                    {
+                        valStr = inner.Substring(valStart + "<arg_value>".Length);
+                        nextPos = inner.Length;
+                    }
+                }
+                else
+                {
+                    nextPos = keyEnd + "</arg_key>".Length;
+                }
+            }
+            else
+            {
+                int valEnd = inner.IndexOf("</arg_value>", keyStart);
+                string segment;
+                if (valEnd >= 0)
+                {
+                    segment = inner.Substring(keyStart + "<arg_key>".Length, valEnd - (keyStart + "<arg_key>".Length));
+                    nextPos = valEnd + "</arg_value>".Length;
+                }
+                else
+                {
+                    segment = inner.Substring(keyStart + "<arg_key>".Length);
+                    nextPos = inner.Length;
+                }
+
+                int arrowIdx = segment.IndexOf('→');
+                if (arrowIdx >= 0)
+                {
+                    keyName = segment.Substring(0, arrowIdx).Trim();
+                    valStr = segment.Substring(arrowIdx + 1);
+                }
+                else
+                {
+                    keyName = segment.Trim();
+                }
+            }
+
+            if (!string.IsNullOrEmpty(keyName))
+            {
+                argsObj[keyName] = valStr;
+            }
+            
+            pos = nextPos;
+        }
+
+        using var doc = JsonDocument.Parse(argsObj.ToJsonString());
+        toolCall = new ToolCall($"call_xml_{index}", toolName, doc.RootElement.Clone());
+        return true;
+    }
+
+    private sealed class XmlStreamFilter
+    {
+        private bool _inToolCall = false;
+        private readonly System.Text.StringBuilder _buffer = new();
+
+        public string Feed(string chunk)
+        {
+            var output = new System.Text.StringBuilder();
+            foreach (char c in chunk)
+            {
+                if (!_inToolCall)
+                {
+                    if (_buffer.Length == 0)
+                    {
+                        if (c == '<')
+                        {
+                            _buffer.Append(c);
+                        }
+                        else
+                        {
+                            output.Append(c);
+                        }
+                    }
+                    else
+                    {
+                        _buffer.Append(c);
+                        string bufStr = _buffer.ToString();
+                        const string target = "<tool_call>";
+                        if (target.StartsWith(bufStr))
+                        {
+                            if (bufStr == target)
+                            {
+                                _inToolCall = true;
+                                _buffer.Clear();
+                            }
+                        }
+                        else
+                        {
+                            output.Append(bufStr);
+                            _buffer.Clear();
+                        }
+                    }
+                }
+                else
+                {
+                    if (_buffer.Length == 0)
+                    {
+                        if (c == '<')
+                        {
+                            _buffer.Append(c);
+                        }
+                    }
+                    else
+                    {
+                        _buffer.Append(c);
+                        string bufStr = _buffer.ToString();
+                        const string target = "</tool_call>";
+                        if (target.StartsWith(bufStr))
+                        {
+                            if (bufStr == target)
+                            {
+                                _inToolCall = false;
+                                _buffer.Clear();
+                            }
+                        }
+                        else
+                        {
+                            _buffer.Clear();
+                            if (c == '<')
+                            {
+                                _buffer.Append(c);
+                            }
+                        }
+                    }
+                }
+            }
+            return output.ToString();
+        }
+
+        public string Flush()
+        {
+            if (!_inToolCall && _buffer.Length > 0)
+            {
+                string remaining = _buffer.ToString();
+                _buffer.Clear();
+                return remaining;
+            }
+            _buffer.Clear();
+            return "";
+        }
+    }
+}

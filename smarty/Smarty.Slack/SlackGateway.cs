@@ -1,0 +1,677 @@
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Smarty.Agents;
+using Smarty.Api;
+
+namespace Smarty.Slack;
+
+/// <summary>
+/// The intake brain. Turns raw Slack events into orchestrator turns, deciding â€” per the two-stage gate â€”
+/// WHEN Smarty should speak:
+///
+///   Stage A (deterministic): an @mention always engages and puts the thread into "listening".
+///   Stage B (cheap classifier): for later untagged messages in a listening thread, ask the qualifier
+///     whether the message is actually for Smarty before replying.
+///
+/// A Slack thread maps onto one <see cref="Session"/> (the same long-lived session the web app uses), keyed
+/// by channel+thread. The first time we engage a thread we backfill what was already said so Smarty has the
+/// full picture. There are no projects here â€” a thread is the only "entry point".
+/// </summary>
+public sealed class SlackGateway
+{
+    private readonly SlackApiClient _api;
+    private readonly Orchestrator _orchestrator;
+    private readonly EngagementQualifier _qualifier;
+    private readonly string _botUserId;
+    private readonly string _uploadsDir;
+    private readonly Regex _mentionRegex;
+    private readonly string? _controlHubUrl; // Smarty.Control hub to forward live events to (null = off)
+    private readonly string? _controlToken;
+    private readonly PeopleStore _people;           // slack ids -> people, so a channel's membership becomes an audience
+    private readonly WhisperTranscriber? _whisper;  // local speech-to-text fallback for voice clips (null = off)
+    private readonly AudioTranscoder? _transcoder;  // ffmpeg → 16 kHz mono WAV for Whisper (null = off)
+
+    private readonly Dictionary<string, SlackThread> _threads = new();
+    private readonly object _threadsLock = new();
+
+    // Slack redelivers events on missed acks â€” dedupe by event_id so we never double-process.
+    private readonly HashSet<string> _seen = new();
+    private readonly Queue<string> _seenOrder = new();
+    private readonly object _seenLock = new();
+
+    public SlackGateway(SlackApiClient api, Orchestrator orchestrator, EngagementQualifier qualifier, string botUserId, string dataDir,
+        PeopleStore people,
+        string? controlHubUrl = null, string? controlToken = null,
+        WhisperTranscriber? whisper = null, AudioTranscoder? transcoder = null)
+    {
+        _api = api;
+        _people = people;
+        _orchestrator = orchestrator;
+        _qualifier = qualifier;
+        _botUserId = botUserId;
+        _uploadsDir = Path.Combine(dataDir, "uploads");
+        _mentionRegex = new Regex(@"<@[A-Z0-9]+>", RegexOptions.Compiled);
+        _controlHubUrl = string.IsNullOrWhiteSpace(controlHubUrl) ? null : controlHubUrl.TrimEnd('/');
+        _controlToken = controlToken;
+        _whisper = whisper;
+        _transcoder = transcoder;
+    }
+
+    /// <summary>One thread's state: its session plus whether we're engaged and have backfilled history.</summary>
+    private sealed class SlackThread
+    {
+        public required Session Session { get; init; }
+        public required string Channel { get; init; }
+        public required string ThreadTs { get; init; }
+
+        /// <summary>True for a public channel ("C…") — open to the organisation, so its room is the wildcard and
+        /// only public knowledge is recalled or recorded there.</summary>
+        public bool IsPublicChannel { get; init; }
+        public bool Backfilled { get; set; }
+        public SemaphoreSlim Gate { get; } = new(1, 1); // serialises this thread's intake decisions
+
+        /// <summary>Distinct human (non-bot) user ids seen in this thread. When it's just one person + Smarty,
+        /// the thread is effectively a 1:1 chat, so we engage with everything they say (banter included);
+        /// the classifier is only needed once other humans are present (to avoid barging into cross-talk).</summary>
+        public HashSet<string> Humans { get; } = new();
+
+        /// <summary>Messages we've decided to act on, waiting to be turned into a reply. A single drain loop
+        /// per thread batches whatever has piled up into ONE turn — so rapid-fire or buffered-then-flushed
+        /// messages produce one reply, not several. <see cref="Draining"/> guards that exactly one loop runs.</summary>
+        public Queue<(string Line, string UserId, string UserName, IReadOnlyList<Attachment>? Attachments)> Pending { get; } = new();
+        public bool Draining { get; set; }
+        public object DrainLock { get; } = new();
+    }
+
+    // A brief settle before a turn, so messages arriving in a burst (e.g. Slack flushing events buffered while
+    // we were restarting, or someone double-tapping) get batched into one reply instead of racing into two.
+    private static readonly TimeSpan CoalesceDelay = TimeSpan.FromMilliseconds(500);
+
+    // Hard cap on how long the debounce will keep waiting for a thread to go quiet — so a relentlessly chatty
+    // thread still gets a reply rather than the turn being deferred forever.
+    private static readonly TimeSpan MaxCoalesceWait = TimeSpan.FromSeconds(10);
+
+    // Set SMARTY_TRACE=1 to log the full intake decision path to stderr (same switch the orchestrator uses).
+    private static readonly bool TraceOn = Environment.GetEnvironmentVariable("SMARTY_TRACE") == "1";
+    private static void Trace(string msg) { if (TraceOn) Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} [gw] {msg}"); }
+    private static string Snip(string s, int max) => s.Length <= max ? s : s[..max] + "…";
+
+    /// <summary>Handle one Events API payload (already acked by the socket layer).</summary>
+    public async Task HandlePayloadAsync(JsonElement payload)
+    {
+        // Interactive payloads (a button click) carry no "event" — route them separately, as the answer to a
+        // waiting task in that thread.
+        if (payload.GetPropertyOrNull("type") == "block_actions")
+        { await HandleBlockActionsAsync(payload).ConfigureAwait(false); return; }
+
+        if (payload.GetPropertyOrNull("event_id") is { } eventId && !FirstTime(eventId))
+        { Trace($"dup event_id {eventId} — skipped"); return; }
+        if (!payload.TryGetProperty("event", out var ev)) return;
+
+        string? type = ev.GetPropertyOrNull("type");
+        if (type is not ("app_mention" or "message")) { Trace($"ignore: type={type}"); return; }
+
+        // Ignore anything from a bot (including ourselves) and message subtypes (edits, joins, our own
+        // thread broadcasts) â€” only real human messages drive a turn.
+        if (ev.GetPropertyOrNull("bot_id") is not null) { Trace("ignore: from a bot"); return; }
+        string? user = ev.GetPropertyOrNull("user");
+        if (user is null || user == _botUserId) { Trace($"ignore: self/no-user ({user})"); return; }
+        if (type == "message" && ev.GetPropertyOrNull("subtype") is { } st && st != "file_share") { Trace($"ignore: subtype={st}"); return; }
+
+        string text = ev.GetPropertyOrNull("text") ?? "";
+        string ts = ev.GetPropertyOrNull("ts") ?? "";
+        string channel = ev.GetPropertyOrNull("channel") ?? "";
+        string? rawThreadTs = ev.GetPropertyOrNull("thread_ts");
+        string threadTs = rawThreadTs ?? ts; // top-level mention roots a new thread
+        if (channel.Length == 0 || ts.Length == 0) return;
+
+        bool isMention = type == "app_mention" || text.Contains($"<@{_botUserId}>", StringComparison.Ordinal);
+        Trace($"event type={type} ch={channel} ts={ts} thread_ts={rawThreadTs ?? "(none→roots new)"} " +
+              $"user={user} mention={isMention} text=\"{Snip(text, 80)}\"");
+
+        // A mention also arrives as a separate "message" event â€” let the app_mention handle it so we don't
+        // process it twice.
+        if (type == "message" && isMention) { Trace("ignore: mention will arrive as app_mention"); return; }
+
+        // Files dropped into the message (a doc to tldr, a file to act on). Parsed cheaply now; only actually
+        // downloaded if we decide to engage (so we don't pull files from cross-talk that isn't for us).
+        var fileRefs = ParseFiles(ev);
+
+        // A recorded voice note's words ARE the message. If Slack already transcribed it (the common case), fold
+        // that in NOW — before the engagement gate — so "is this for me / additive?" is judged on what was said,
+        // not on an empty body. Clips Slack hasn't transcribed yet are resolved after we engage (download + local
+        // Whisper), keeping the "don't pull audio from cross-talk" rule for the heavy path. A plain audio UPLOAD
+        // (no clip markers) is deliberately left as a file — never transcribed into a command.
+        string nativeVoice = string.Join(" ", fileRefs
+            .Where(f => f.Clip.NativeTranscript is { Length: > 0 })
+            .Select(f => $"(voice note) {f.Clip.NativeTranscript}"));
+        if (nativeVoice.Length > 0)
+        {
+            text = string.IsNullOrWhiteSpace(text) ? nativeVoice : $"{text} {nativeVoice}";
+            Trace($"folded native transcript into text: \"{Snip(nativeVoice, 80)}\"");
+        }
+
+        var thread = GetThread(channel, threadTs);
+        await thread.Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            thread.Humans.Add(user); // this speaker counts toward 1:1-vs-group
+
+            if (isMention)
+            {
+                await BackfillIfNeededAsync(thread, ts).ConfigureAwait(false);
+                Trace($"engage (mention); history now {thread.Session.History.Count} msgs");
+                await EngageAsync(thread, user, text, fileRefs).ConfigureAwait(false);
+                return;
+            }
+
+            // Untagged message in a thread we've never been tagged in â†’ not our conversation, ignore.
+            if (!thread.Backfilled) { Trace("ignore: untagged msg in a thread we're not listening to"); return; }
+
+            string author = await _api.GetUserNameAsync(user).ConfigureAwait(false);
+            string clean = CleanText(text);
+
+            // Is Smarty waiting on a question in this thread? If so the bar flips: the message only counts if
+            // it's actually answering Smarty — not if the user is turning to a colleague.
+            var waitingTask = thread.Session.Tasks.Values
+                .Where(t => t.Status == "waiting").OrderByDescending(t => t.StartedAt).FirstOrDefault();
+
+            // respond=false is the "[ack]" outcome: keep the message in context, post nothing, consume nothing.
+            bool respond;
+            if (MentionsAnotherUser(text))
+            {
+                // Explicitly tagging a specific colleague (and not Smarty) → it's for them. Defer.
+                respond = false;
+                Trace("[ack]: message tags another user, not Smarty");
+            }
+            else if (waitingTask is not null)
+            {
+                // Waiting for an answer — check it's FOR Smarty even in a 1:1 (they may defer to someone). A
+                // "no" keeps the task waiting and posts nothing, so a stray line never gets eaten as the answer.
+                var recent = RecentLines(thread.Session);
+                respond = await _qualifier.ShouldRespondAsync(recent, author, clean, waitingTask.Pending?.Question).ConfigureAwait(false);
+                Trace($"[ack?] waiting-aware respond={respond} for \"{Snip(clean, 60)}\"");
+            }
+            else if (thread.Humans.Count <= 1)
+            {
+                // 1:1 (just this person + Smarty) → it's all addressed to Smarty; engage with everything.
+                respond = true;
+                Trace("1:1 thread — engaging without classifier");
+            }
+            else
+            {
+                var recent = RecentLines(thread.Session);
+                respond = await _qualifier.ShouldRespondAsync(recent, author, clean).ConfigureAwait(false);
+                Trace($"qualifier respond={respond} (humans={thread.Humans.Count}) for \"{Snip(clean, 60)}\"");
+            }
+
+            if (respond)
+                await EngageAsync(thread, user, text, fileRefs).ConfigureAwait(false);
+            else
+                await AppendQuietlyAsync(thread.Session, $"{author}: {clean}").ConfigureAwait(false);
+        }
+        finally
+        {
+            thread.Gate.Release();
+        }
+    }
+
+    // A button click from a question's options. We extract the clicked value + which thread it's in, then run
+    // it through EngageAsync exactly as if the user had typed that option — so it routes back to the task that's
+    // waiting on the question (the normal answer path), buttons or not.
+    private async Task HandleBlockActionsAsync(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("actions", out var actions) || actions.ValueKind != JsonValueKind.Array
+            || actions.GetArrayLength() == 0)
+            return;
+        var action = actions[0];
+        string value = action.GetPropertyOrNull("value") ?? "";
+        string? user = payload.TryGetProperty("user", out var u) ? u.GetPropertyOrNull("id") : null;
+        string channel = payload.TryGetProperty("channel", out var ch) ? (ch.GetPropertyOrNull("id") ?? "") : "";
+        string threadTs = "";
+        if (payload.TryGetProperty("message", out var msg))
+            threadTs = msg.GetPropertyOrNull("thread_ts") ?? msg.GetPropertyOrNull("ts") ?? "";
+        if (threadTs.Length == 0 && payload.TryGetProperty("container", out var cont))
+            threadTs = cont.GetPropertyOrNull("thread_ts") ?? cont.GetPropertyOrNull("message_ts") ?? "";
+        if (string.IsNullOrWhiteSpace(value) || channel.Length == 0 || threadTs.Length == 0 || user is null)
+        { Trace("block_actions: missing context — ignored"); return; }
+
+        Trace($"block_actions: ch={channel} thread={threadTs} user={user} value=\"{Snip(value, 40)}\"");
+        var thread = GetThread(channel, threadTs);
+        await thread.Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            thread.Humans.Add(user);
+            await EngageAsync(thread, user, value, Array.Empty<SlackFileRef>()).ConfigureAwait(false);
+        }
+        finally { thread.Gate.Release(); }
+    }
+
+    /// <summary>Fire a scheduled task into its thread (called by the <see cref="Scheduler"/>). Attaches or
+    /// reuses the thread's session and makes sure it has context — a cold session (e.g. after a restart) is
+    /// backfilled from the whole Slack thread; a live one already has current history — then runs the frozen
+    /// instruction, whose result/file posts back into the thread as a proactive nudge.</summary>
+    public async Task FireScheduledAsync(ScheduledTask t)
+    {
+        var thread = GetThread(t.Channel, t.ThreadTs);
+        await thread.Gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            await BackfillIfNeededAsync(thread, "").ConfigureAwait(false);
+        }
+        finally { thread.Gate.Release(); }
+        await _orchestrator.RunScheduledAsync(thread.Session, t.TaskText, t.UserScope, t.UserName).ConfigureAwait(false);
+    }
+
+    // Run a turn for a message we've decided is for us. If a task in this thread is waiting on a question,
+    // the message is its answer â€” route it back so the worker resumes (mirrors the web app's answer path).
+    private async Task EngageAsync(SlackThread thread, string user, string rawText, IReadOnlyList<SlackFileRef> fileRefs)
+    {
+        string author = await _api.GetUserNameAsync(user).ConfigureAwait(false);
+        string clean = CleanText(rawText);
+
+        // Split recorded clips from ordinary uploads. A clip's CONTENT is its transcript (folded into the turn),
+        // so the audio file itself doesn't go into the file pot; everything else (incl. a plain .wav upload) is a
+        // normal attachment the model can read/act on.
+        var clipRefs = fileRefs.Where(f => f.Clip.IsClip).ToList();
+        var plainRefs = fileRefs.Where(f => !f.Clip.IsClip).ToList();
+
+        // Now that we've decided this turn is for us, pull any attached (non-clip) files down to disk.
+        var attachments = await DownloadAttachmentsAsync(thread, plainRefs).ConfigureAwait(false);
+
+        // Clips whose native transcript wasn't ready at intake: try files.info, then local Whisper. The ready
+        // ones were already folded into rawText, so we only chase the stragglers here.
+        string fallbackVoice = await ResolveClipTranscriptsAsync(thread, clipRefs).ConfigureAwait(false);
+        if (fallbackVoice.Length > 0)
+            clean = string.IsNullOrWhiteSpace(clean) ? fallbackVoice : $"{clean} {fallbackVoice}";
+
+        if (clean.Length == 0 && clipRefs.Count > 0 && attachments is null)
+            // A voice note we couldn't transcribe at all (no native transcript, files.info/Whisper unavailable).
+            // Don't sit blank or guess at words — say what happened so the user can repeat it or type instead.
+            clean = "(sent a voice note, but I couldn't transcribe it — could you type the gist, or try again?)";
+        else if (clean.Length == 0 && attachments is null)
+            // A bare "@smarty" with no message. Don't hand the model an empty prompt — that's what made it
+            // flail/spiral. Give it a clear directive to engage with the THREAD it was tagged in, so it picks
+            // up the actual context instead of replying "huh?".
+            clean = "(tagged you with no message — read the thread above and jump in on what's being discussed: " +
+                    "answer the open question, offer to help, or do the obvious next thing. Only ask what they " +
+                    "want if there's genuinely nothing to go on.)";
+        else if (clean.Length == 0 && attachments is not null)
+            // A file dropped with no words. Don't sit blank — take a look and offer the obvious next thing.
+            clean = "(shared this file with no message — take a look at what it is and offer to help: summarise " +
+                    "it, pull out the key points, or ask what they'd like done with it.)";
+        string line = $"{author}: {clean}";
+
+        var waiting = thread.Session.Tasks.Values
+            .Where(t => t.Status == "waiting")
+            .OrderByDescending(t => t.StartedAt)
+            .FirstOrDefault();
+
+        if (waiting is not null)
+        {
+            Trace($"route to waiting task #{waiting.Id} as its answer: \"{Snip(line, 60)}\"");
+            // Acknowledge immediately so answering a question doesn't drop into silence while the worker
+            // resumes and grinds away — otherwise it feels like the answer went nowhere.
+            _ = _api.PostMessageAsync(thread.Channel, thread.ThreadTs, "Got it, thanks — picking that back up now 👍");
+            _ = Task.Run(async () =>
+            {
+                try { await _orchestrator.AnswerTaskAsync(thread.Session, waiting, line, $"user:{user}", author, attachments); }
+                catch (Exception ex) { Console.Error.WriteLine($"[slack] answer-task: {ex.Message}"); }
+            });
+            return;
+        }
+
+        // Normal path: queue the line and make sure the thread's single drain loop is running. Batching
+        // happens there, so two messages in quick succession become one turn (one reply), not two.
+        bool startDrain;
+        lock (thread.DrainLock)
+        {
+            thread.Pending.Enqueue((line, user, author, attachments));
+            startDrain = !thread.Draining;
+            if (startDrain) thread.Draining = true;
+        }
+        Trace($"queued for turn: \"{Snip(line, 60)}\"{(startDrain ? " (starting drain)" : " (drain running)")}");
+        if (startDrain)
+            _ = Task.Run(() => DrainThreadAsync(thread));
+    }
+
+    // One drain loop per thread. Each pass DEBOUNCES — it waits for the thread to fall quiet for CoalesceDelay
+    // (resetting whenever a new message lands, up to MaxCoalesceWait) — then takes EVERYTHING pending and runs
+    // it as ONE turn. So a burst spread over a few seconds (one person bumps with info, another chimes in)
+    // collapses into a single adapted reply instead of stacking "answer, then answer". Anything that arrives
+    // while a turn is running is picked up by the next pass as one combined turn, never a parallel reply. Exits
+    // when the queue is empty, atomically clearing Draining so the next message restarts it.
+    private async Task DrainThreadAsync(SlackThread thread)
+    {
+        while (true)
+        {
+            // Debounce: settle until no new message has arrived for a full CoalesceDelay (capped).
+            int waited = 0, lastCount = -1;
+            while (true)
+            {
+                int count;
+                lock (thread.DrainLock) count = thread.Pending.Count;
+                if (count == lastCount) break;                 // quiet for a full window → settled
+                lastCount = count;
+                await Task.Delay(CoalesceDelay).ConfigureAwait(false);
+                waited += (int)CoalesceDelay.TotalMilliseconds;
+                if (waited >= MaxCoalesceWait.TotalMilliseconds) break; // chatty thread — stop waiting, reply now
+            }
+
+            List<(string Line, string UserId, string UserName, IReadOnlyList<Attachment>? Attachments)> batch;
+            lock (thread.DrainLock)
+            {
+                batch = new(thread.Pending);
+                thread.Pending.Clear();
+                if (batch.Count == 0) { thread.Draining = false; return; }
+            }
+
+            // Join the batch into one user turn. Near-duplicate re-tags (the buffered + the manual retry)
+            // collapse here, so Smarty answers the gist once instead of echoing each. The most recent speaker
+            // is whose memory this turn reads/writes (in the common 1:1 case the whole batch is one person).
+            string combined = string.Join("\n", batch.Select(b => b.Line));
+            var (_, lastUser, lastName, _) = batch[^1];
+            // Gather every file across the batch into this one turn (a burst could include several uploads).
+            var attachments = batch.Where(b => b.Attachments is not null).SelectMany(b => b.Attachments!).ToList();
+            Trace($"turn for {batch.Count} message(s){(attachments.Count > 0 ? $", {attachments.Count} file(s)" : "")}: \"{Snip(combined, 80)}\"");
+            // Establish the room BEFORE the turn: who is in this channel right now, as people. Re-read every
+            // turn, so someone joining a private channel narrows recall on the very next message.
+            await EstablishRoomAsync(thread, lastUser, CancellationToken.None).ConfigureAwait(false);
+            try { await _orchestrator.HandleMessageAsync(thread.Session, combined, CancellationToken.None, $"user:{lastUser}", lastName, attachments.Count > 0 ? attachments : null).ConfigureAwait(false); }
+            catch (Exception ex) { Console.Error.WriteLine($"[slack] handle-message: {ex.Message}"); }
+        }
+    }
+
+    // The first time we engage a thread, pull in what was already said so Smarty isn't blind to the
+    // conversation it was dropped into. Skips the bot's own posts and the triggering message itself.
+    private async Task BackfillIfNeededAsync(SlackThread thread, string triggeringTs)
+    {
+        if (thread.Backfilled) return;
+        thread.Backfilled = true;
+
+        // Tell Smarty which channel it's in, so its replies fit the room (#food vs #engineering). Seeded as
+        // the first context line of the thread; stable for the thread's life. Best-effort — null if the
+        // channels:read scope isn't granted.
+        var channelName = await _api.GetChannelNameAsync(thread.Channel).ConfigureAwait(false);
+        if (channelName is not null)
+        {
+            await SeedSystemAsync(thread.Session, $"This conversation is happening in the #{channelName} channel.").ConfigureAwait(false);
+            Trace($"channel resolved: #{channelName}");
+        }
+
+        var replies = await _api.GetThreadRepliesAsync(thread.Channel, thread.ThreadTs).ConfigureAwait(false);
+        Trace($"backfill: thread {thread.ThreadTs} has {replies.Count} message(s) in it (via conversations.replies)");
+        int added = 0;
+        foreach (var m in replies)
+        {
+            if (m.User == _botUserId)
+            {
+                if (m.Ts == triggeringTs) continue;
+                string cleanBot = CleanText(m.Text);
+                if (cleanBot.Length == 0) continue;
+                await AppendAssistantQuietlyAsync(thread.Session, cleanBot).ConfigureAwait(false);
+                Trace($"backfill + assistant: \"{Snip(cleanBot, 60)}\"");
+                added++;
+                continue;
+            }
+            if (m.BotId is not null) continue; // skip other bots
+            if (m.User is not null) thread.Humans.Add(m.User);         // count everyone who spoke before us
+            if (m.Ts == triggeringTs) continue;                        // the live mention is passed separately
+            if (m.User is null) continue;
+            string clean = CleanText(m.Text);
+            if (clean.Length == 0) continue;
+            string author = await _api.GetUserNameAsync(m.User).ConfigureAwait(false);
+            await AppendQuietlyAsync(thread.Session, $"{author}: {clean}").ConfigureAwait(false);
+            Trace($"backfill + \"{author}: {Snip(clean, 60)}\"");
+            added++;
+        }
+        Trace($"backfill: {added} line(s) added to context");
+    }
+
+    // Add a human line to the session history WITHOUT triggering a turn — used for backfill and for messages
+    // the qualifier judged not-for-us, so the thread context stays complete. Guarded by the turn lock so it
+    // can't race a running turn's own history writes.
+    private static async Task AppendQuietlyAsync(Session session, string line)
+    {
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try { session.History.Add(Message.User(line)); }
+        finally { session.TurnLock.Release(); }
+    }
+
+    // Add an assistant line to the session history WITHOUT triggering a turn — used for backfill.
+    // Guarded by the turn lock so it can't race a running turn's own history writes.
+    private static async Task AppendAssistantQuietlyAsync(Session session, string text)
+    {
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try { session.History.Add(Message.Assistant(text)); }
+        finally { session.TurnLock.Release(); }
+    }
+
+    // Seed a System context line into the thread's history (e.g. which channel we're in). The orchestrator
+    // includes history every turn, so this rides along like part of the prompt. Guarded by the turn lock.
+    private static async Task SeedSystemAsync(Session session, string text)
+    {
+        await session.TurnLock.WaitAsync().ConfigureAwait(false);
+        try { session.History.Add(Message.System(text)); }
+        finally { session.TurnLock.Release(); }
+    }
+
+    /// <summary>
+    /// Work out whose conversation this is, as people, and hand the brain the room.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A channel's membership IS the audience — that is the whole model. A DM resolves to two people, a private
+    /// channel to its members, and a public channel to the wildcard (anyone in the organisation), which recalls
+    /// and records public knowledge only.
+    /// </para>
+    /// <para>
+    /// Recomputed every turn on purpose. It costs a cached lookup, and it's what makes membership drift correct
+    /// for free: nobody has to remember to revoke anything when a fourth person joins.
+    /// </para>
+    /// </remarks>
+    private async Task EstablishRoomAsync(SlackThread thread, string? speakerId, CancellationToken ct)
+    {
+        var session = thread.Session;
+        var speaker = await _people.ResolveAsync($"slack:{speakerId}", ct).ConfigureAwait(false);
+
+        // A public channel is open to the whole organisation, so it is the wildcard room — not a big audience.
+        if (thread.IsPublicChannel)
+        {
+            session.IsPublicRoom = true;
+            session.Room = BrainContext.PublicRoom(speaker);
+            Trace($"room for {thread.Channel}: public");
+            return;
+        }
+
+        var memberIds = await _api.GetChannelMembersAsync(thread.Channel, ct).ConfigureAwait(false);
+        var participants = await _people.ResolveAllAsync(
+            memberIds.Where(id => id != _botUserId).Select(id => $"slack:{id}"), ct).ConfigureAwait(false);
+
+        session.IsPublicRoom = false;
+        session.ParticipantAliases = memberIds.Select(id => $"slack:{id}").ToList();
+        session.Room = participants.Count > 0
+            ? BrainContext.Group(participants, speaker)
+            : BrainContext.Unknown; // couldn't identify anyone — public-only recall, and no writes
+
+        Trace($"room for {thread.Channel}: {session.Room.Room} " +
+              $"({memberIds.Count} member(s), {participants.Count} identified)");
+    }
+
+    private SlackThread GetThread(string channel, string threadTs)
+    {
+        string key = $"{channel}:{threadTs}";
+        lock (_threadsLock)
+        {
+            if (_threads.TryGetValue(key, out var existing)) return existing;
+            var session = new Session($"slack:{key}");
+            bool isDm = channel.StartsWith("D", StringComparison.OrdinalIgnoreCase);
+            // A public channel ("C…") is open to the organisation; a DM ("D…") or private channel ("G…") has a
+            // membership that becomes the audience. The room itself is established per turn.
+            bool isPublic = channel.StartsWith("C", StringComparison.OrdinalIgnoreCase);
+            Trace($"session created for thread {key}; DM={isDm}, public={isPublic}");
+            IEventSink sink = new SlackThreadSink(_api, channel, threadTs); // events -> this thread
+            // Also mirror this thread's events to the Smarty.Control hub (cross-process, best-effort) so the
+            // command centre shows Slack threads streaming live alongside the web chat.
+            if (_controlHubUrl is not null)
+            {
+                var forwarder = new HubForwardingSink(
+                    _controlHubUrl + "/api/control/ingest", _controlToken, session.Id, "slack",
+                    () => new ConversationMeta(
+                        Subtitle: isDm ? "Direct message" : $"#{channel}",
+                        UserName: session.CurrentUserName));
+                sink = new CompositeEventSink(sink, forwarder);
+            }
+            session.Sink = sink;
+            var thread = new SlackThread { Session = session, Channel = channel, ThreadTs = threadTs, IsPublicChannel = isPublic };
+            _threads[key] = thread;
+            return thread;
+        }
+    }
+
+    // The last few human/assistant lines, for the qualifier's context.
+    private static IReadOnlyList<string> RecentLines(Session session)
+    {
+        var lines = new List<string>();
+        foreach (var m in session.History)
+        {
+            if (m.Role == Role.User && !string.IsNullOrWhiteSpace(m.Content)) lines.Add(m.Content!);
+            else if (m.Role == Role.Assistant && !string.IsNullOrWhiteSpace(m.Content)) lines.Add($"Smarty: {m.Content}");
+        }
+        return lines;
+    }
+
+    // Strip Slack mention tokens (<@U123>) and tidy whitespace, so the model sees plain text.
+    private string CleanText(string text) =>
+        Regex.Replace(_mentionRegex.Replace(text, ""), @"\s+", " ").Trim();
+
+    // True if the text @mentions a real Slack user OTHER than Smarty — a strong signal the message is aimed at
+    // that colleague, not the bot. (Channel/here/everyone broadcasts aren't user ids, so they don't count.)
+    private bool MentionsAnotherUser(string text)
+    {
+        foreach (Match m in _mentionRegex.Matches(text))
+        {
+            var id = m.Value.Trim('<', '@', '>');
+            if (id.Length > 0 && !string.Equals(id, _botUserId, StringComparison.Ordinal))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>A file Slack reported on a message, before we've downloaded it. <see cref="Clip"/> records
+    /// whether Slack treated it as a recorded voice/video clip (spoken words to act on) vs. an ordinary upload.</summary>
+    private sealed record SlackFileRef(string Id, string Name, string? Mime, long Size, string UrlDownload, AudioClipInfo Clip);
+
+    // Pull the file metadata off an event's "files" array (cheap — no network). url_private_download is the
+    // authenticated download link; fall back to url_private if it's absent.
+    private static IReadOnlyList<SlackFileRef> ParseFiles(JsonElement ev)
+    {
+        if (!ev.TryGetProperty("files", out var files) || files.ValueKind != JsonValueKind.Array)
+            return Array.Empty<SlackFileRef>();
+        var list = new List<SlackFileRef>();
+        foreach (var f in files.EnumerateArray())
+        {
+            string? url = f.GetPropertyOrNull("url_private_download") ?? f.GetPropertyOrNull("url_private");
+            if (url is null) continue;
+            string id = f.GetPropertyOrNull("id") ?? Guid.NewGuid().ToString("N")[..8];
+            string name = f.GetPropertyOrNull("name") ?? f.GetPropertyOrNull("title") ?? $"file-{id}";
+            string? mime = f.GetPropertyOrNull("mimetype");
+            long size = f.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number ? s.GetInt64() : 0;
+            var clip = AudioClipInfo.Detect(f);
+            // Slack under-documents the clip fields — dump the raw object once we see audio so the real field
+            // names/values can be confirmed against a live payload (then this trace can be tightened).
+            if (TraceOn && (clip.IsClip || (mime?.StartsWith("audio", StringComparison.OrdinalIgnoreCase) ?? false)))
+                Trace($"audio file object: clip={clip.IsClip} status={clip.TranscriptionStatus ?? "-"} " +
+                      $"nativeTranscript={(clip.NativeTranscript is { Length: > 0 } ? "yes" : "no")} raw={Snip(f.GetRawText(), 600)}");
+            list.Add(new SlackFileRef(id, name, mime, size, url, clip));
+        }
+        return list;
+    }
+
+    // Download a turn's files to the uploads dir (one folder per thread) and return them as Attachments.
+    // Best-effort: a file that won't download (e.g. missing files:read scope) is skipped, not fatal. Returns
+    // null when there's nothing to hand on.
+    private async Task<IReadOnlyList<Attachment>?> DownloadAttachmentsAsync(SlackThread thread, IReadOnlyList<SlackFileRef> fileRefs)
+    {
+        if (fileRefs.Count == 0) return null;
+        string dir = Path.Combine(_uploadsDir, SafeName($"{thread.Channel}-{thread.ThreadTs}"));
+        var result = new List<Attachment>();
+        foreach (var f in fileRefs)
+        {
+            string dest = Path.Combine(dir, $"{f.Id}-{SafeName(f.Name)}");
+            if (await _api.DownloadFileAsync(f.UrlDownload, dest).ConfigureAwait(false))
+            {
+                Trace($"downloaded \"{f.Name}\" ({f.Size}B) -> {dest}");
+                result.Add(new Attachment(f.Name, dest, f.Mime, f.Size));
+            }
+            else Trace($"download failed for \"{f.Name}\"");
+        }
+        return result.Count > 0 ? result : null;
+    }
+
+    // Resolve transcripts for recorded clips whose native transcript wasn't ready at intake. Two-step fallback:
+    //   1. files.info — Slack transcribes asynchronously, so a re-read often has it by the time we engage (free,
+    //      and the right answer when the workspace supports native transcription).
+    //   2. local Whisper — download the clip, transcode to 16 kHz mono WAV (ffmpeg), transcribe on-device. The
+    //      same engine the web app uses; covers workspaces/regions where Slack doesn't transcribe.
+    // Returns the combined "(voice note) ..." text (empty if nothing could be transcribed). Best-effort throughout.
+    private async Task<string> ResolveClipTranscriptsAsync(SlackThread thread, IReadOnlyList<SlackFileRef> clipRefs)
+    {
+        if (clipRefs.Count == 0) return "";
+        var parts = new List<string>();
+        string dir = Path.Combine(_uploadsDir, SafeName($"{thread.Channel}-{thread.ThreadTs}"));
+
+        foreach (var f in clipRefs)
+        {
+            if (f.Clip.NativeTranscript is { Length: > 0 }) continue; // ready ones were folded in at intake
+
+            // 1. Ask Slack again — the transcript may have finished processing since the event arrived.
+            var info = await _api.GetAudioClipInfoAsync(f.Id).ConfigureAwait(false);
+            if (info?.NativeTranscript is { Length: > 0 } native)
+            {
+                Trace($"clip \"{f.Name}\": native transcript via files.info");
+                parts.Add(native);
+                continue;
+            }
+
+            // 2. Local Whisper. Needs both the transcoder (ffmpeg) and the transcriber to be configured.
+            if (_whisper is null || _transcoder is null)
+            {
+                Trace($"clip \"{f.Name}\": no native transcript and local Whisper not configured — skipping");
+                continue;
+            }
+            string src = Path.Combine(dir, $"{f.Id}-{SafeName(f.Name)}");
+            if (!await _api.DownloadFileAsync(f.UrlDownload, src).ConfigureAwait(false))
+            { Trace($"clip \"{f.Name}\": download failed — skipping"); continue; }
+
+            string wav = Path.Combine(dir, $"{f.Id}-whisper.wav");
+            if (!await _transcoder.ToWhisperWavAsync(src, wav).ConfigureAwait(false))
+            { Trace($"clip \"{f.Name}\": transcode failed — skipping"); continue; }
+
+            try
+            {
+                await using var stream = File.OpenRead(wav);
+                string text = (await _whisper.TranscribeAsync(stream).ConfigureAwait(false)).Trim();
+                if (text.Length > 0) { Trace($"clip \"{f.Name}\": Whisper transcript ({text.Length} chars)"); parts.Add(text); }
+                else Trace($"clip \"{f.Name}\": Whisper produced no text");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[slack] whisper error for \"{f.Name}\": {ex.Message}"); }
+        }
+
+        return parts.Count == 0 ? "" : string.Join(" ", parts.Select(p => $"(voice note) {p}"));
+    }
+
+    private static string SafeName(string name) =>
+        string.Concat(name.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+
+    private bool FirstTime(string eventId)
+    {
+        lock (_seenLock)
+        {
+            if (!_seen.Add(eventId)) return false;
+            _seenOrder.Enqueue(eventId);
+            if (_seenOrder.Count > 1000) _seen.Remove(_seenOrder.Dequeue()); // bound the memory
+            return true;
+        }
+    }
+}

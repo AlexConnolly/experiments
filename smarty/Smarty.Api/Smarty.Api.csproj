@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net7.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Smarty.Api</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+    <PackageReference Include="Whisper.net" Version="1.5.0" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.5.0" />
+    <!-- Structured document rendering (build_document): .docx via OpenXML, .pdf via MigraDoc/PDFsharp (both MIT). -->
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.1.0" />
+    <PackageReference Include="PDFsharp-MigraDoc" Version="6.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\Smarty.Agents\Smarty.Agents.csproj" />
+    <ProjectReference Include="..\src\Smarty.Brain\Smarty.Brain.csproj" />
+    <!-- The contract an uploaded plugin is compiled against. It must be loaded by the HOST, not out of the
+         package, or the IPlugin the plugin implements is a different type from the one we look for. -->
+    <ProjectReference Include="..\src\Smarty.Plugins\Smarty.Plugins.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Smarty.Agents.Tests" />
+  </ItemGroup>
+
+</Project>

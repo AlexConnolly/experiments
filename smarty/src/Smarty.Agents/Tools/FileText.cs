@@ -1,0 +1,179 @@
+﻿using System.IO.Compression;
+using System.Text;
+using System.Text.RegularExpressions;
+using UglyToad.PdfPig;
+using UglyToad.PdfPig.DocumentLayoutAnalysis.TextExtractor;
+
+namespace Smarty.Agents;
+
+/// <summary>
+/// Turns a file on disk into readable plain text — the single place that knows WHICH formats Smarty can
+/// read. The strategy is deliberately "be smart, not exhaustive": handle the formats that need real parsing
+/// (PDF and Word .docx today; images slot in later), fall back to sniffing the bytes for anything text-shaped (so any
+/// code/config/markup file just works without enumerating every extension), and otherwise say plainly that
+/// the format isn't supported yet — never throw, never hand back garbage.
+/// </summary>
+public static class FileText
+{
+    /// <summary>The outcome of extraction: the text (when <paramref name="Ok"/>), or a friendly reason it
+    /// couldn't be read (a missing file, or a format not supported yet).</summary>
+    /// <param name="Kind">What it turned out to be — "PDF", "Word document", "web page", "text". Named in the
+    /// window's header so the model knows whether it's looking at extracted prose or at source.</param>
+    public readonly record struct ExtractResult(string Text, bool Ok, string? Reason, string Kind = "text");
+
+    private static ExtractResult Fail(string reason) => new("", false, reason);
+    private static ExtractResult Success(string text, string kind = "text") => new(text, true, null, kind);
+
+    /// <summary>Extract readable text from a file. Best-effort and total — any failure comes back as a
+    /// readable reason in <see cref="ExtractResult.Reason"/>, never an exception.</summary>
+    public static ExtractResult Extract(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return Fail("No file path was given.");
+        if (!File.Exists(path)) return Fail($"There's no file at '{path}'.");
+
+        string ext = Path.GetExtension(path).ToLowerInvariant();
+        try
+        {
+            switch (ext)
+            {
+                case ".pdf":
+                    return ExtractPdf(path);
+
+                case ".html":
+                case ".htm":
+                    return Success(WebSearcherTool.ToPlainText(File.ReadAllText(path)), "web page");
+
+                case ".docx":
+                    return ExtractDocx(path);
+
+                // Known binaries we can't read yet — say so clearly instead of sniffing them into noise.
+                // (.doc is the old binary Word format — a different beast from the zipped .docx above.)
+                case ".doc":
+                case ".pptx":
+                case ".ppt":
+                case ".xlsx":
+                case ".xls":
+                    return Fail($"I can't read {ext} files yet — text-based files and PDFs are supported so far.");
+                case ".png":
+                case ".jpg":
+                case ".jpeg":
+                case ".gif":
+                case ".webp":
+                case ".bmp":
+                case ".tiff":
+                    // Naming the tool that CAN do it, because "not supported" sent a worker looking for a way to
+                    // read a screenshot as text instead of to the one tool that can see it.
+                    return Fail(
+                        $"That's an image ({ext}) — this tool reads text. Use describe_image with the same file " +
+                        "name to see what's in it.");
+
+                default:
+                    return ExtractTextLike(path);
+            }
+        }
+        catch (Exception ex)
+        {
+            return Fail($"Couldn't read '{Path.GetFileName(path)}': {ex.Message}");
+        }
+    }
+
+    private static ExtractResult ExtractPdf(string path)
+    {
+        using var doc = PdfDocument.Open(path);
+        var sb = new StringBuilder();
+        foreach (var page in doc.GetPages())
+        {
+            // ContentOrderTextExtractor reconstructs reading order (and spacing) far better than the raw
+            // page.Text; fall back to page.Text if it can't for a given page.
+            string pageText;
+            try { pageText = ContentOrderTextExtractor.GetText(page); }
+            catch { pageText = page.Text; }
+            if (!string.IsNullOrWhiteSpace(pageText)) sb.Append(pageText.Trim()).Append("\n\n");
+        }
+        var text = sb.ToString().Trim();
+        return text.Length > 0
+            ? Success(text, "PDF")
+            : Fail("That PDF has no extractable text (it may be scanned images — that needs OCR, which isn't supported yet).");
+    }
+
+    // A .docx is a Zip of XML parts; the body text lives in word/document.xml as <w:t> runs inside <w:p>
+    // paragraphs. Reading it doesn't need a full Office parser: pull that part, turn the paragraph/line/tab
+    // markers into whitespace, then strip the remaining tags and decode entities. Good enough to feed the
+    // document's TEXT (brand guidelines, a brief) to a worker — it doesn't try to reconstruct table layout or
+    // styling, and it ignores headers/footers (which live in separate parts).
+    private static ExtractResult ExtractDocx(string path)
+    {
+        using var zip = ZipFile.OpenRead(path); // throws on a non-zip (e.g. a .doc renamed .docx) → caught upstream
+        var entry = zip.GetEntry("word/document.xml");
+        if (entry is null)
+            return Fail("That .docx is missing its document body (word/document.xml) — it may be corrupt.");
+        string xml;
+        using (var reader = new StreamReader(entry.Open(), Encoding.UTF8))
+            xml = reader.ReadToEnd();
+        var text = DocxXmlToText(xml);
+        return text.Length > 0
+            ? Success(text, "Word document")
+            : Fail("That .docx has no extractable text (it may be empty or contain only images).");
+    }
+
+    private static readonly Regex DocxParagraph = new(@"</w:p>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DocxBreak = new(@"<w:br\b[^>]*/?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DocxTabRun = new(@"<w:tab\b[^>]*/?>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex DocxAnyTag = new(@"<[^>]+>", RegexOptions.Compiled);
+    private static readonly Regex DocxTrailingWs = new(@"[ \t]+\n", RegexOptions.Compiled);
+    private static readonly Regex DocxBlankRuns = new(@"\n{3,}", RegexOptions.Compiled);
+
+    private static string DocxXmlToText(string xml)
+    {
+        // Turn structural markers into whitespace BEFORE stripping tags, so paragraphs and line breaks survive.
+        xml = DocxParagraph.Replace(xml, "\n");
+        xml = DocxBreak.Replace(xml, "\n");
+        xml = DocxTabRun.Replace(xml, "\t");
+        // Drop every remaining tag — the run text (<w:t> contents) is left behind and concatenated.
+        string text = DocxAnyTag.Replace(xml, "");
+        text = System.Net.WebUtility.HtmlDecode(text); // &amp; &lt; &#xNN; …
+        text = DocxTrailingWs.Replace(text, "\n");
+        text = DocxBlankRuns.Replace(text, "\n\n");
+        return text.Trim();
+    }
+
+    // For anything not a recognised binary: read the bytes and decide whether they're text. Real documents
+    // (code, csv, json, yaml, logs, markdown…) decode cleanly as UTF-8 with very few control bytes; a binary
+    // file is full of NULs and other control characters. This lets arbitrary text formats "just work" without
+    // a hard-coded extension list, while still rejecting binaries we don't have a parser for.
+    private static ExtractResult ExtractTextLike(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes.Length == 0) return Success(""); // an empty file is legitimately empty, not unreadable
+
+        // A UTF-16/UTF-8 BOM is a strong "this is text" signal; otherwise sniff a leading sample.
+        bool hasBom = bytes.Length >= 2 &&
+            ((bytes[0] == 0xFF && bytes[1] == 0xFE) || (bytes[0] == 0xFE && bytes[1] == 0xFF) ||
+             (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF));
+
+        if (!hasBom)
+        {
+            int sample = Math.Min(bytes.Length, 8000);
+            int control = 0;
+            for (int i = 0; i < sample; i++)
+            {
+                byte b = bytes[i];
+                if (b == 0) return Fail(BinaryReason(path));            // a NUL byte → definitely binary
+                if (b < 0x09 || (b > 0x0D && b < 0x20)) control++;      // control chars outside tab/CR/LF
+            }
+            if ((double)control / sample > 0.02) return Fail(BinaryReason(path));
+        }
+
+        // StreamReader honours the BOM and otherwise decodes as UTF-8 — good enough for the text formats we
+        // expect; a stray bad byte becomes a replacement char rather than failing the read.
+        using var reader = new StreamReader(new MemoryStream(bytes), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return Success(reader.ReadToEnd());
+    }
+
+    private static string BinaryReason(string path)
+    {
+        string ext = Path.GetExtension(path);
+        string kind = string.IsNullOrEmpty(ext) ? "That file" : $"That looks like a binary {ext} file";
+        return $"{kind} — I can't read it as text. Text-based files and PDFs are supported so far.";
+    }
+}

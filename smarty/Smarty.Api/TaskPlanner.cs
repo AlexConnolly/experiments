@@ -1,0 +1,537 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Smarty.Agents;
+
+namespace Smarty.Api;
+
+/// <summary>
+/// The planning layer for delegated work. Before a worker runs, a cheap GATE sizes up the task: a quick
+/// lookup or one-off action runs straight away (no overhead), but a complex, multi-step or long-horizon job
+/// is handed to a PLANNER first — a focused agent (with read-only recon tools) that scopes the unknowns and
+/// produces a concrete, ordered plan. That plan is seeded into the full-tooled executor, which carries it
+/// out. Simple things stay snappy; hard, long-horizon tasks get the structure they need to not wander.
+/// </summary>
+public sealed class TaskPlanner
+{
+    private readonly IModelProvider _provider;
+    private readonly ModelSpec _modelSpec;
+    private readonly Func<IReadOnlyList<AgentTool>>? _reconTools;
+    private readonly string _model;
+    private readonly ModelProviderRegistry _registry;
+
+    public TaskPlanner(ModelSpec modelSpec, ModelProviderRegistry? registry = null, Func<IReadOnlyList<AgentTool>>? reconTools = null)
+    {
+        _modelSpec = modelSpec;
+        _registry = registry ?? ModelProviderRegistry.Default;
+        _provider = _registry.Resolve(modelSpec);
+        _model = modelSpec.Model;
+        _reconTools = reconTools;
+    }
+
+    public TaskPlanner(string model, string ollamaBaseUrl, Func<IReadOnlyList<AgentTool>>? reconTools = null)
+        : this(ResolveModelSpec(model, ollamaBaseUrl), null, reconTools)
+    {
+    }
+
+    private static ModelSpec ResolveModelSpec(string model, string ollamaBaseUrl) =>
+        ModelRouting.Spec(model, ollamaBaseUrl);
+
+    private static JsonNode ComplexitySchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["complexity"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("simple", "complex") },
+            ["reason"] = new JsonObject { ["type"] = "string" },
+        },
+        ["required"] = new JsonArray("complexity"),
+    };
+
+    /// <summary>The gate: is this task complex enough to warrant a plan? Cheap, fast, schema-forced (so the
+    /// verdict is a real field, not parsed from prose). On any error it returns false — treat as simple — so
+    /// planning can never block getting on with the work.</summary>
+    public async Task<bool> IsComplexAsync(string task, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Classify how much planning this task needs.\n" +
+                    "- \"simple\": one lookup or a quick action a single pass can finish (look up / check one thing, " +
+                    "a short answer, a single booking).\n" +
+                    "- \"complex\": multi-step or long-horizon work that benefits from a plan first — diagnosing or " +
+                    "fixing a problem, building or organising something, comparing across many sources, anything " +
+                    "with several dependent steps.\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = ComplexitySchema(),
+                MaxOutputTokens = 80,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return false;
+            using var doc = JsonDocument.Parse(response.Content);
+            return doc.RootElement.TryGetProperty("complexity", out var c)
+                   && string.Equals(c.GetString(), "complex", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    private static JsonNode ClarifySchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["needs"] = new JsonObject { ["type"] = "boolean" },
+            ["question"] = new JsonObject { ["type"] = "string" },
+            ["options"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+        },
+        ["required"] = new JsonArray("needs"),
+    };
+
+    /// <summary>Decide, BEFORE any work, whether one clarifying question is genuinely needed — a material gap
+    /// (definition/scope/preference) that changes the result, isn't in the task or known facts, and has no safe
+    /// default. Returns the question + likely options, or (null, empty) to just proceed. Never asks about taste,
+    /// or to confirm something it could just do. Best-effort: any failure proceeds without asking.</summary>
+    public async Task<(string? Question, IReadOnlyList<string> Options)> ClarifyAsync(string task, string knownFacts, CancellationToken ct)
+    {
+        var none = ((string?)null, (IReadOnlyList<string>)Array.Empty<string>());
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Before this task is carried out, decide if ONE clarifying question is genuinely needed. Ask " +
+                    "ONLY when a specific detail would MATERIALLY change the result — a definition, a scope, or a " +
+                    "preference — that is NOT answered by the task text or what's already available below AND has " +
+                    "no safe default. Do NOT ask to confirm something you could just do, and NEVER ask about " +
+                    "taste or aesthetics. If it's clear enough to proceed, set needs=false. When you do ask, give " +
+                    "one sharp question and 2–4 likely short answers.\n\n" +
+                    // The distinction that decides it: this is not background reading, it is what the worker will
+                    // already have in hand. Anything answered here must not be asked about — that is what makes a
+                    // specific request go straight through while a vague one gets one question.
+                    "ALREADY AVAILABLE to the worker (memory, the project and what's known about it, its lists, " +
+                    "the files in this conversation). Treat all of it as known — never ask for anything it " +
+                    "answers:\n" + (string.IsNullOrWhiteSpace(knownFacts) ? "(nothing)" : knownFacts) +
+                    "\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = ClarifySchema(),
+                MaxOutputTokens = 160,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await ((IModelProvider)_provider).CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return none;
+            using var doc = JsonDocument.Parse(response.Content);
+            var root = doc.RootElement;
+            if (!(root.TryGetProperty("needs", out var n) && n.ValueKind == JsonValueKind.True)) return none;
+            var q = root.TryGetProperty("question", out var qe) && qe.ValueKind == JsonValueKind.String ? qe.GetString()?.Trim() : null;
+            if (string.IsNullOrWhiteSpace(q)) return none;
+            var opts = new List<string>();
+            if (root.TryGetProperty("options", out var oe) && oe.ValueKind == JsonValueKind.Array)
+                foreach (var o in oe.EnumerateArray())
+                    if (o.ValueKind == JsonValueKind.String && o.GetString()?.Trim() is { Length: > 0 } s) opts.Add(s);
+            return (q, opts);
+        }
+        catch { return none; }
+    }
+
+    private const string PlannerSystem =
+        "You are the PLANNING step for a capable executor agent that will carry out a task afterwards with full " +
+        "tools. Your job is to produce a clear, concrete, ordered PLAN — NOT to do the task or write the final " +
+        "deliverable.\n" +
+        "If you have recon tools, you MAY use a couple of quick lookups ONLY to scope unknowns you need in order " +
+        "to plan well — do not carry out the task itself. Then output the plan as " +
+        "3–7 short, concrete numbered steps the executor should follow, ending with a single \"Done when: …\" line " +
+        "that defines success. Be specific and lean — no preamble, no fluff.";
+
+    /// <summary>Produce a plan for a complex task. Runs a focused agent (with any recon tools) whose final
+    /// answer IS the plan. Returns null if it couldn't produce one — the executor then just proceeds unplanned,
+    /// exactly as today.</summary>
+    public async Task<string?> PlanAsync(string task, CancellationToken ct, string guide = "")
+    {
+        try
+        {
+            var tools = _reconTools?.Invoke() ?? Array.Empty<AgentTool>();
+            var input = new AgentInput
+            {
+                SystemPrompt = PlannerSystem,
+                Model = _modelSpec,
+                Tools = tools.ToList(),
+                Think = true,
+                MaxIterations = tools.Count > 0 ? 5 : 2, // room for a little recon, never the whole job
+            };
+            var plan = await new SmartyAgent(input, _registry).Answer(
+                "Plan this task (do not carry it out):\n" + task + guide, ct).ConfigureAwait(false);
+            return string.IsNullOrWhiteSpace(plan) ? null : plan.Trim();
+        }
+        catch { return null; }
+    }
+
+    // ── Multi-discipline routing ────────────────────────────────────────────────────────────────────────
+    // The gate above decides "does this need a plan?" for a SINGLE worker. The methods below answer a
+    // different question: does the task span more than one DISCIPLINE (data → product → engineering → review)
+    // that no single persona can cover? Triage is a quick ballpark — name the disciplines, in order. Only when
+    // it finds more than one do we pay for a step breakdown. Everything fails open to "no plan" so routing can
+    // never block the work.
+
+    private static JsonNode StringArraySchema(string prop) => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            [prop] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+        },
+        ["required"] = new JsonArray(prop),
+    };
+
+    /// <summary>Quick gate: which specialist personas does this task need, IN ORDER? Most tasks return one (or
+    /// none) — only a genuine cross-discipline job returns several. Cheap and schema-forced; returns an empty
+    /// list on any error so the caller falls back to the ordinary single-worker path.</summary>
+    public async Task<IReadOnlyList<string>> TriageDisciplinesAsync(string task, string roster, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Route a task to specialist disciplines. From the roster, list the persona ids this task " +
+                    "needs, IN THE ORDER they must run. Most tasks need exactly ONE (or none — leave empty for " +
+                    "general work). Return MORE THAN ONE only when the task genuinely spans different disciplines " +
+                    "that hand off to each other (e.g. analyse data, THEN write tickets, THEN change code). Do " +
+                    "not pad — fewer is better.\n\nRoster:\n" + roster + "\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = StringArraySchema("personas"),
+                MaxOutputTokens = 120,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            return ParseStringArray(response.Content, "personas");
+        }
+        catch { return Array.Empty<string>(); }
+    }
+
+    private static JsonNode AssessSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["personas"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+            ["complexity"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("simple", "complex") },
+        },
+        ["required"] = new JsonArray("personas", "complexity"),
+    };
+
+    /// <summary>ONE sizing call that answers BOTH questions the old triage + complexity gates asked separately:
+    /// which specialist disciplines the task needs (in order), and whether it's complex enough to warrant a plan.
+    /// Folding them halves the per-delegation planning overhead. Fails open (no disciplines, simple) so it can
+    /// never block the work.</summary>
+    public async Task<(IReadOnlyList<string> Disciplines, bool Complex)> AssessTaskAsync(string task, string roster, CancellationToken ct)
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Quickly size up a task for a team of specialists. Answer two things:\n" +
+                    "1) personas: from the roster, the persona ids this task needs, IN ORDER. Most tasks need ONE " +
+                    "(or none — leave empty for general work). Return MORE THAN ONE only when it genuinely spans " +
+                    "different disciplines that hand off to each other. Don't pad — fewer is better.\n" +
+                    "2) complexity: \"simple\" for a single lookup or quick action one pass can finish; \"complex\" " +
+                    "for multi-step or long-horizon work that benefits from a plan first.\n\n" +
+                    "Roster:\n" + roster + "\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = AssessSchema(),
+                MaxOutputTokens = 140,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return (Array.Empty<string>(), false);
+            var disciplines = ParseStringArray(response.Content, "personas");
+            using var doc = JsonDocument.Parse(response.Content);
+            bool complex = doc.RootElement.TryGetProperty("complexity", out var c)
+                           && string.Equals(c.GetString(), "complex", StringComparison.OrdinalIgnoreCase);
+            return (disciplines, complex);
+        }
+        catch { return (Array.Empty<string>(), false); }
+    }
+
+    private static JsonNode StepsSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["steps"] = new JsonObject
+            {
+                ["type"] = "array",
+                ["items"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["persona"] = new JsonObject { ["type"] = "string" },
+                        ["instruction"] = new JsonObject { ["type"] = "string" },
+                        ["produces"] = new JsonObject { ["type"] = "string" },
+                        ["wave"] = new JsonObject { ["type"] = "integer" },
+                    },
+                    ["required"] = new JsonArray("persona", "instruction", "produces", "wave"),
+                },
+            },
+        },
+        ["required"] = new JsonArray("steps"),
+    };
+
+    /// <summary>Break a cross-discipline task into an ordered list of single-persona steps. Each step names the
+    /// persona, what it must do (self-contained — it can read files earlier steps left in the shared area), and
+    /// the concrete artifact it hands on. Returns null if it couldn't produce a usable plan.</summary>
+    public async Task<WorkPlan?> PlanStepsAsync(string task, string roster, CancellationToken ct, string guide = "")
+    {
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "Break this task into a minimal set of steps, each handled by ONE persona from the roster. For " +
+                    "each step give: persona (an id from the roster), instruction (what that specialist must do, " +
+                    "self-contained), produces (the concrete artifact it hands on), and wave (an integer, 0-based).\n" +
+                    "HANDOFF — each step's written output is passed to later steps AUTOMATICALLY as text, so a step " +
+                    "should just PRODUCE its result as its answer; do NOT tell a step to 'save it to a .md file' and a " +
+                    "later step to 'read that file' — that's a wasted, fragile round-trip. Only require a FILE when " +
+                    "the deliverable is INHERENTLY a file the user receives (a designed PDF, an image, a spreadsheet, " +
+                    "a data export). Written analysis, guidelines, copy, strategy → text output, not a file.\n" +
+                    "WAVES — think about what can run AT THE SAME TIME to finish faster: steps that DON'T need each " +
+                    "other's output go in the SAME wave (they run in parallel); a step that needs an earlier step's " +
+                    "output goes in a LATER wave (higher number). Example: analysing data and researching the market " +
+                    "are independent → wave 0 both; writing the report needs both → wave 1. Only force a step into a " +
+                    "later wave when it genuinely depends on an earlier one — default to the same wave when in doubt, " +
+                    "so independent work isn't needlessly serialised. No preamble.\n\n" +
+                    "Roster:\n" + roster + "\n\nTask:\n" + task + guide),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = true,
+                ResponseFormat = StepsSchema(),
+                MaxOutputTokens = 900,
+                TurnTimeout = TimeSpan.FromSeconds(45),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            return ParsePlan(response.Content, task);
+        }
+        catch { return null; }
+    }
+
+    private static JsonNode VerifySchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["ok"] = new JsonObject { ["type"] = "boolean" },
+            ["reason"] = new JsonObject { ["type"] = "string" },
+        },
+        ["required"] = new JsonArray("ok"),
+    };
+
+    /// <summary>Did a step actually produce what it was meant to? Lenient about format, strict about substance —
+    /// the guard against a worker that claims success but handed on nothing usable. An empty result fails for
+    /// free (no model call). The verifier never blocks progress on its OWN failure — it returns ok=true so a
+    /// flaky verifier can't stall a plan.</summary>
+    public async Task<(bool Ok, string Reason)> VerifyStepAsync(
+        string instruction, string produces, string result, CancellationToken ct,
+        IReadOnlyList<string>? filesPresent = null)
+    {
+        if (string.IsNullOrWhiteSpace(result) || string.Equals(result.Trim(), "(no result)", StringComparison.OrdinalIgnoreCase))
+            return (false, "the step produced no usable result");
+        try
+        {
+            // The deliverable can be EITHER the result text OR a file the step produced — give the verifier the
+            // files now in the shared area so it doesn't fail a step that put its work in a file. The result text
+            // can then legitimately be a short "done — saved X" note.
+            string files = filesPresent is { Count: > 0 }
+                ? "Files now in the shared area: " + string.Join(", ", filesPresent)
+                : "No files in the shared area.";
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "A step in a plan has finished. Decide if its output satisfies what the step was meant to " +
+                    "produce. Be lenient about format, strict about substance. The deliverable may be the TEXT " +
+                    "output below OR a file the step created (see the file list) — pass if EITHER carries the work.\n" +
+                    "Set ok=false only if the work genuinely isn't there — including when the output merely says it " +
+                    "is ABOUT to do it (e.g. 'now let me write the analysis', 'I'll create…') with nothing actually " +
+                    "produced, or it ran out before finishing. Give a one-line reason.\n\n" +
+                    "Step: " + instruction + "\nExpected output: " + produces + "\n" + files + "\n\nActual output:\n" + result),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = VerifySchema(),
+                MaxOutputTokens = 120,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return (true, "");
+            using var doc = JsonDocument.Parse(response.Content);
+            bool ok = !doc.RootElement.TryGetProperty("ok", out var o) || o.ValueKind != JsonValueKind.False;
+            string reason = doc.RootElement.TryGetProperty("reason", out var r) ? (r.GetString() ?? "") : "";
+            return (ok, reason);
+        }
+        catch { return (true, ""); }
+    }
+
+    private static JsonNode RouteSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["step"] = new JsonObject { ["type"] = "integer" },   // 1-based existing step, or 0 to append a new one
+            ["persona"] = new JsonObject { ["type"] = "string" }, // when step == 0: the persona for the new step
+        },
+        ["required"] = new JsonArray("step"),
+    };
+
+    /// <summary>Route a user refinement onto a running/finished plan: which step does it touch? Returns a
+    /// 0-based step index to re-enter at, or (-1, persona) to append a brand-new step. Defaults to the LAST
+    /// step on any uncertainty (the most recent thing the user saw).</summary>
+    public async Task<(int StepIndex, string? NewPersona)> RouteRefineAsync(WorkPlan plan, string roster, string message, CancellationToken ct)
+    {
+        int last = plan.Steps.Count - 1;
+        try
+        {
+            var sb = new System.Text.StringBuilder("Plan steps:\n");
+            for (int i = 0; i < plan.Steps.Count; i++)
+                sb.Append($"{i + 1}. [{plan.Steps[i].Persona}] {plan.Steps[i].Instruction}\n");
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "A plan has already run. The user now asks for a change. Decide where it belongs:\n" +
+                    "- If it adjusts what an EXISTING step produced, return that step's number (1-based).\n" +
+                    "- If it is genuinely new work needing a different discipline, return step = 0 and the " +
+                    "persona id (from the roster) that should do it as a new appended step.\n\n" +
+                    sb + "\nRoster:\n" + roster + "\n\nUser's change:\n" + message),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = RouteSchema(),
+                MaxOutputTokens = 80,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return (last, null);
+            using var doc = JsonDocument.Parse(response.Content);
+            int step = doc.RootElement.TryGetProperty("step", out var s) && s.TryGetInt32(out var n) ? n : last + 1;
+            if (step <= 0)
+            {
+                string? persona = doc.RootElement.TryGetProperty("persona", out var p) ? p.GetString() : null;
+                return (-1, string.IsNullOrWhiteSpace(persona) ? null : persona!.Trim());
+            }
+            int idx = step - 1;
+            return (idx >= 0 && idx < plan.Steps.Count ? idx : last, null);
+        }
+        catch { return (last, null); }
+    }
+
+    private static JsonNode BrandSchema() => new JsonObject
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject { ["brand"] = new JsonObject { ["type"] = "string" } },
+        ["required"] = new JsonArray("brand"),
+    };
+
+    /// <summary>For branding work at a brand AGENCY: which client brand is this task for? Given the known brand
+    /// slugs and the task, return the slug to use, or "house" for the agency's own brand / when none is named.
+    /// Resolves from context; defaults to "house" on any doubt so it never blocks (the worker can flag if it's
+    /// genuinely unsure). With no client brands known, it's always "house".</summary>
+    public async Task<string> ResolveBrandAsync(string task, IReadOnlyList<string> brandSlugs, CancellationToken ct)
+    {
+        var clients = brandSlugs.Where(s => !string.Equals(s, "house", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (clients.Count == 0) return "house";
+        try
+        {
+            var convo = new List<Message>
+            {
+                Message.User(
+                    "This is branding work at an agency that has its own 'house' brand and separate brands for " +
+                    "clients. Which brand is THIS task for? Return one slug from the list, or \"house\" for the " +
+                    "agency's own brand or when no client is named. If unsure, return \"house\".\n\n" +
+                    "Client brands: " + string.Join(", ", clients) + "\n\nTask:\n" + task),
+            };
+            var request = new ModelRequest
+            {
+                Model = _model,
+                Messages = convo,
+                Think = false,
+                ResponseFormat = BrandSchema(),
+                MaxOutputTokens = 40,
+                TurnTimeout = TimeSpan.FromSeconds(25),
+            };
+            var response = await _provider.CompleteAsync(request, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(response.Content)) return "house";
+            using var doc = JsonDocument.Parse(response.Content);
+            var slug = doc.RootElement.TryGetProperty("brand", out var b) ? b.GetString()?.Trim() : null;
+            if (string.IsNullOrWhiteSpace(slug)) return "house";
+            // Only trust a slug that actually exists; otherwise fall back rather than mount a phantom brand.
+            return brandSlugs.FirstOrDefault(s => string.Equals(s, slug, StringComparison.OrdinalIgnoreCase)) ?? "house";
+        }
+        catch { return "house"; }
+    }
+
+    private static IReadOnlyList<string> ParseStringArray(string? content, string prop)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return Array.Empty<string>();
+        using var doc = JsonDocument.Parse(content);
+        var list = new List<string>();
+        if (doc.RootElement.TryGetProperty(prop, out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var e in arr.EnumerateArray())
+                if (e.ValueKind == JsonValueKind.String && e.GetString() is { Length: > 0 } v)
+                    list.Add(v.Trim());
+        return list;
+    }
+
+    private static WorkPlan? ParsePlan(string? content, string goal)
+    {
+        if (string.IsNullOrWhiteSpace(content)) return null;
+        using var doc = JsonDocument.Parse(content);
+        if (!doc.RootElement.TryGetProperty("steps", out var arr) || arr.ValueKind != JsonValueKind.Array)
+            return null;
+        var steps = new List<PlanStep>();
+        int seq = 0;
+        foreach (var e in arr.EnumerateArray())
+        {
+            string? persona = e.TryGetProperty("persona", out var p) ? p.GetString() : null;
+            string? instruction = e.TryGetProperty("instruction", out var ins) ? ins.GetString() : null;
+            string produces = e.TryGetProperty("produces", out var pr) ? (pr.GetString() ?? "") : "";
+            // A missing/garbled wave degrades to fully sequential (its own position) — never worse than today.
+            int wave = e.TryGetProperty("wave", out var w) && w.ValueKind == JsonValueKind.Number && w.TryGetInt32(out var n) && n >= 0
+                ? n : seq;
+            if (!string.IsNullOrWhiteSpace(persona) && !string.IsNullOrWhiteSpace(instruction))
+                steps.Add(new PlanStep(persona!.Trim(), instruction!.Trim(), produces.Trim()) { Wave = wave });
+            seq++;
+        }
+        return steps.Count > 0 ? new WorkPlan { Goal = goal, Steps = steps } : null;
+    }
+}
