@@ -168,8 +168,8 @@ If you're running locally, make sure Ollama is up (`ollama serve`, or it starts 
 ### 3. Get the code
 
 ```bash
-git clone https://github.com/AlexConnolly/smarty.git
-cd smarty
+git clone https://github.com/AlexConnolly/experiments.git
+cd experiments/smarty
 ```
 
 ### 4. Build the web UI
